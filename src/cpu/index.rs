@@ -1,17 +1,20 @@
 use crate::consts::{
     BRICK_INDEX_ENCODING_BIAS, BRICKMAP_SIZE, BRICKS_PER_BRICKMAP, EMPTY_BRICK_INDEX,
-    INDEX_WORDS_PER_CELL, WEDGE_WORDS_PER_CELL,
+    INDEX_WORDS_PER_CELL, ISO_WORDS_PER_CELL, WEDGE_WORDS_PER_CELL,
 };
 use bevy_math::*;
 use bytemuck::{self, Pod, Zeroable};
 use std::marker::PhantomData;
 
-const _: () = assert!(BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL == INDEX_WORDS_PER_CELL);
+const _: () = assert!(
+    BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL + ISO_WORDS_PER_CELL == INDEX_WORDS_PER_CELL
+);
 
 /// Cell-local index buffer: the brick lookup grid (`0..BRICKS_PER_BRICKMAP`, indexed in
-/// *flipped* brick coordinates) followed by the per-brick density wedge states
-/// (`BRICKS_PER_BRICKMAP..INDEX_WORDS_PER_CELL`, packed 2 bits per brick and indexed in
-/// *raw* brick coordinates).
+/// *flipped* brick coordinates), the per-brick density wedge states
+/// (`BRICKS_PER_BRICKMAP..` that + `WEDGE_WORDS_PER_CELL`, packed 2 bits per brick),
+/// then the per-brick iso-meshing flags (1 bit per brick), all indexed in *raw* brick
+/// coordinates.
 #[repr(C)]
 pub struct IndexGrid {
     indices: [u32; INDEX_WORDS_PER_CELL],
@@ -56,6 +59,25 @@ impl IndexGrid {
         let word = Self::wedge_index(coord);
         let shift = (Self::index(coord) % 16) * 2;
         self.indices[word] = (self.indices[word] & !(0b11 << shift)) | (state << shift);
+    }
+
+    fn iso_index(coord: UVec3) -> usize {
+        BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL + Self::index(coord) / 32
+    }
+    /// Sets the iso-meshing flag of the brick at raw `coord`.
+    pub fn set_iso(&mut self, coord: UVec3, iso: bool) {
+        let word = Self::iso_index(coord);
+        let bit = 1u32 << (Self::index(coord) % 32);
+        self.indices[word] = if iso {
+            self.indices[word] | bit
+        } else {
+            self.indices[word] & !bit
+        };
+    }
+    /// Iso-meshing flag of the brick at raw `coord`.
+    pub fn iso(&self, coord: UVec3) -> bool {
+        let word = self.indices[Self::iso_index(coord)];
+        word & (1u32 << (Self::index(coord) % 32)) != 0
     }
 
     pub fn slice_range(&self, from: usize, to: usize) -> &[u32] {

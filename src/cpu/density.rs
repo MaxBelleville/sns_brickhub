@@ -56,6 +56,18 @@ impl WedgeState {
     }
 }
 
+/// How a cell's bricks should be surfaced. This is a render-mode decision stored
+/// per brick (iso flag in the index buffer) and is orthogonal to the BSDF kind of
+/// the packed material: a Lambertian brick can be meshed, and a metal brick can
+/// stay blocky.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshMode {
+    /// Render as voxel cubes through the occupancy/density raymarcher.
+    Blocky,
+    /// Flag shell bricks so the Transvoxel meshing dispatch polygonizes them.
+    Iso,
+}
+
 fn corner_index(corner: UVec3) -> usize {
     let axis = DENSITY_CORNERS_PER_AXIS;
     (corner.x as usize) + (corner.y as usize) * axis + (corner.z as usize) * axis * axis

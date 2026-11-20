@@ -2,6 +2,7 @@ use crate::consts::{
     BRICKS_PER_BRICKMAP, BrickID, CELL_SIZE, CellID, DENSITY_WORDS_PER_CELL, INDEX_WORDS_PER_CELL,
     MaterialID, VOXELS_PER_BRICK,
 };
+use crate::cpu::density::MeshMode;
 use crate::cpu::{CellDelta, StorageType, map};
 use bevy_math::prelude::*;
 use std::ops::Range;
@@ -71,11 +72,18 @@ impl BrickHubCell {
     /// Builds a detached cell from a raw-coordinate density sampler (negative inside,
     /// positive outside; corner coordinates in `0..65` per axis) plus the material every
     /// surface-touching voxel receives. Bricks are classified solid/shell from the corner
-    /// field so GPU consumers can skip whole bricks. Later `insert`/`remove` edits update
-    /// the occupancy path but not the density field or wedges; rebuild the cell after
+    /// field so GPU consumers can skip whole bricks. With `MeshMode::Iso`, shell bricks
+    /// are flagged for Transvoxel meshing; `MeshMode::Blocky` leaves them on the
+    /// raymarched voxel path. Later `insert`/`remove` edits update the occupancy path
+    /// but not the density field, wedges, or iso flags; rebuild the cell after
     /// density-significant edits.
-    pub fn from_density(&mut self, sample: impl FnMut(UVec3) -> f32, material: MaterialID) {
-        let ranges = self.map.build_from_density(sample, material);
+    pub fn from_density(
+        &mut self,
+        sample: impl FnMut(UVec3) -> f32,
+        material: MaterialID,
+        mode: MeshMode,
+    ) {
+        let ranges = self.map.build_from_density(sample, material, mode);
         self.delta
             .register_range(StorageType::Indices, 0, INDEX_WORDS_PER_CELL);
         self.delta

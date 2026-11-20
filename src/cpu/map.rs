@@ -10,7 +10,7 @@ use crate::{
         BRICK_SIZE, BRICKMAP_SIZE, BRICKS_PER_BRICKMAP, BrickID, BrickIndex, CELL_SIZE,
         DENSITY_CORNERS_PER_AXIS, DENSITY_CORNERS_PER_CELL, MaterialID, VOXELS_PER_BRICK,
     },
-    cpu::density::{DENSITY_UNSET, DensityField, WedgeState, corner_position},
+    cpu::density::{DENSITY_UNSET, DensityField, MeshMode, WedgeState, corner_position},
     cpu::index::{IndexGrid, IndexKind},
 };
 
@@ -181,6 +181,18 @@ impl BrickMap {
         WedgeState::from_bits(bits)
     }
 
+    /// Whether the brick at raw coordinates is flagged for iso (Transvoxel) meshing.
+    /// Outside the cell-local grid this is always false.
+    pub fn brick_is_iso(&self, raw_brick: UVec3) -> bool {
+        if raw_brick.x >= BRICKMAP_SIZE as u32
+            || raw_brick.y >= BRICKMAP_SIZE as u32
+            || raw_brick.z >= BRICKMAP_SIZE as u32
+        {
+            return false;
+        }
+        self.grid.index.iso(raw_brick)
+    }
+
     /// Whether the voxel at raw coordinates is recorded as occupied. Outside the
     /// 64^3 cell it is always unoccupied.
     pub fn voxel_is_occupied(&self, raw_voxel: UVec3) -> bool {
@@ -211,11 +223,13 @@ impl BrickMap {
     /// Builds the whole cell from a raw-coordinate density sampler (negative inside,
     /// positive outside; corners at `0..65` per axis). Shell and solid bricks get brick
     /// records and per-voxel material entries; wedge states are stored per raw brick
-    /// coordinate. The `sample` function is called once per corner.
+    /// coordinate, and shell bricks are additionally flagged for iso meshing when
+    /// `mode` is `MeshMode::Iso`. The `sample` function is called once per corner.
     pub(crate) fn build_from_density(
         &mut self,
         mut sample: impl FnMut(UVec3) -> f32,
         material: MaterialID,
+        mode: MeshMode,
     ) -> MapBuildRanges {
         self.clear();
         self.storage.density.fill_from_fn(&mut sample);
@@ -314,6 +328,12 @@ impl BrickMap {
                     );
                     self.grid.status.set_active(brick_index);
                     self.grid.index.set_wedge(raw_coord, wedge.bits());
+                    // Only shell bricks need polygonizing; solid interiors and empty
+                    // space contribute no isosurface.
+                    self.grid.index.set_iso(
+                        raw_coord,
+                        mode == MeshMode::Iso && wedge == WedgeState::Shell,
+                    );
                     brick_count += 1;
                 }
             }

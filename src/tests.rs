@@ -234,7 +234,7 @@ fn solid_cell_builds_full_bricks_and_coalesced_deltas() {
 /// and register deltas across all four storage types.
 #[test]
 fn density_cell_classifies_bricks_and_registers_all_deltas() {
-    use crate::cpu::density::WedgeState;
+    use crate::cpu::density::{MeshMode, WedgeState};
 
     let mut cell = BrickHubCell::empty();
     cell.from_density(
@@ -243,6 +243,7 @@ fn density_cell_classifies_bricks_and_registers_all_deltas() {
             p.length() - 16.0
         },
         17,
+        MeshMode::Iso,
     );
 
     let active_bricks = {
@@ -272,6 +273,12 @@ fn density_cell_classifies_bricks_and_registers_all_deltas() {
                         map.wedge_state(raw),
                         Some(expected),
                         "wedge mismatch at {raw:?}"
+                    );
+                    // Iso mode flags exactly the shell bricks for meshing.
+                    assert_eq!(
+                        map.brick_is_iso(raw),
+                        expected == WedgeState::Shell,
+                        "iso flag mismatch at {raw:?}"
                     );
                     wedge_counts[expected as usize] += 1;
                 }
@@ -309,6 +316,25 @@ fn density_cell_classifies_bricks_and_registers_all_deltas() {
         cell.delta().take(StorageType::Density),
         Some((0, DENSITY_WORDS_PER_CELL))
     );
+}
+
+/// Blocky build paths (occupancy-sampler and solid) never flag bricks for iso
+/// meshing; the flag exists only for density cells built in `MeshMode::Iso`.
+#[test]
+fn blocky_paths_leave_iso_flags_unset() {
+    for cell in [
+        BrickHubCell::from_voxel_sampler(|voxel| (voxel.y < 4).then_some(5)),
+        BrickHubCell::solid(9),
+    ] {
+        let map = cell.map();
+        for raw_z in 0..BRICKMAP_SIZE as u32 {
+            for raw_y in 0..BRICKMAP_SIZE as u32 {
+                for raw_x in 0..BRICKMAP_SIZE as u32 {
+                    assert!(!map.brick_is_iso(UVec3::new(raw_x, raw_y, raw_z)));
+                }
+            }
+        }
+    }
 }
 
 #[test]

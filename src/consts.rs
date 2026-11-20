@@ -48,8 +48,15 @@ pub const DENSITY_WORDS_PER_CELL: usize = DENSITY_CORNERS_PER_CELL.div_ceil(2);
 pub const WEDGE_BITS_PER_BRICK: usize = 2;
 pub const BRICKS_PER_WEDGE_WORD: usize = 32 / WEDGE_BITS_PER_BRICK;
 pub const WEDGE_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP / BRICKS_PER_WEDGE_WORD;
-/// Total words of the cell-local index buffer: brick lookup grid plus wedge states.
-pub const INDEX_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL;
+/// Per-brick iso-meshing flag packed as 1 bit, `ISO_WORDS_PER_CELL` words after the
+/// wedge states (32 bricks per u32 word). Bricks flagged for iso are candidates for
+/// Transvoxel meshing; unflagged bricks render as voxel cubes. Raw brick
+/// coordinates, same convention as the wedge states.
+pub const ISO_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP / 32;
+/// Total words of the cell-local index buffer: brick lookup grid, wedge states,
+/// iso flags.
+pub const INDEX_WORDS_PER_CELL: usize =
+    BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL + ISO_WORDS_PER_CELL;
 
 pub const KIND_BITS: u16 = 2;
 pub const PROPERTY_BITS: u16 = 6;

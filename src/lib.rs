@@ -28,7 +28,7 @@ pub mod prelude {
         GeneratedCellResult, GeneratedCellStatus, GenerationToken,
     };
     pub use crate::consts::*;
-    pub use crate::cpu::density::{DensityField, WedgeState};
+    pub use crate::cpu::density::{DensityField, MeshMode, WedgeState};
     pub use crate::cpu::index::LodKind;
     pub use crate::cpu::map::{brick_index_to_voxel, voxel_in_brick};
     pub use crate::cpu::material::{
