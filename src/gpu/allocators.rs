@@ -1,6 +1,8 @@
 use bevy_math::*;
 
-use crate::{BRICKS_PER_BRICKMAP, CellID, VOXELS_PER_BRICK};
+use crate::consts::{
+    BRICKS_PER_BRICKMAP, CellID, DENSITY_WORDS_PER_CELL, INDEX_WORDS_PER_CELL, VOXELS_PER_BRICK,
+};
 
 use std::collections::HashMap;
 
@@ -9,6 +11,7 @@ pub struct DeviceAllocator {
     bricks: RangeAllocator,
     materials: RangeAllocator,
     indices: RangeAllocator,
+    density: RangeAllocator,
     allocations: HashMap<CellID, CellAllocation>,
     pending_compactions: HashMap<CellID, PendingCompaction>,
     quarantined: Vec<CellAllocation>,
@@ -19,7 +22,8 @@ impl DeviceAllocator {
         self.allocations.entry(coord).or_insert_with(|| {
             let brick_count = BRICKS_PER_BRICKMAP;
             let material_count = BRICKS_PER_BRICKMAP * VOXELS_PER_BRICK;
-            let index_count = BRICKS_PER_BRICKMAP;
+            let index_count = INDEX_WORDS_PER_CELL;
+            let density_count = DENSITY_WORDS_PER_CELL;
 
             // Allocate from free ranges or grow
             let brick_base = self
@@ -34,6 +38,10 @@ impl DeviceAllocator {
                 .indices
                 .alloc(index_count)
                 .expect("index allocation overflow");
+            let density_base = self
+                .density
+                .alloc(density_count)
+                .expect("density allocation overflow");
             CellAllocation {
                 brick_base,
                 brick_count,
@@ -41,6 +49,8 @@ impl DeviceAllocator {
                 material_count,
                 index_base,
                 index_count,
+                density_base,
+                density_count,
                 ring,
             }
         })
@@ -91,6 +101,18 @@ impl DeviceAllocator {
                     return Err(error);
                 }
             };
+            let density_base = match self.density.alloc(old.density_count) {
+                Ok(base) => base,
+                Err(error) => {
+                    self.bricks.free(brick_base, old.brick_count);
+                    self.materials.free(material_base, old.material_count);
+                    self.indices.free(index_base, old.index_count);
+                    for reserved in reservations {
+                        self.free_allocation(reserved.new);
+                    }
+                    return Err(error);
+                }
+            };
             reservations.push(CompactionReservation {
                 id: candidate.id,
                 old,
@@ -101,6 +123,8 @@ impl DeviceAllocator {
                     material_count: old.material_count,
                     index_base,
                     index_count: old.index_count,
+                    density_base,
+                    density_count: old.density_count,
                     ring: old.ring,
                 },
             });
@@ -184,12 +208,15 @@ impl DeviceAllocator {
             .free(allocation.material_base, allocation.material_count);
         self.indices
             .free(allocation.index_base, allocation.index_count);
+        self.density
+            .free(allocation.density_base, allocation.density_count);
     }
     pub fn is_fragmented_for(&self, size: usize) -> bool {
         // Fragmented if we have free ranges but ring is still full
         self.bricks.is_fragmented_for(size)
             || self.materials.is_fragmented_for(size)
             || self.indices.is_fragmented_for(size)
+            || self.density.is_fragmented_for(size)
     }
 
     pub fn select_compaction_candidates(&self, ring: u8) -> Vec<CompactionCandidate> {
@@ -245,6 +272,10 @@ impl DeviceAllocator {
 
     pub fn index_capacity(&self) -> usize {
         self.indices.capacity()
+    }
+
+    pub fn density_capacity(&self) -> usize {
+        self.density.capacity()
     }
 }
 
@@ -321,6 +352,9 @@ pub struct CellAllocation {
 
     index_base: usize,
     index_count: usize,
+
+    density_base: usize,
+    density_count: usize,
     ring: u8,
 }
 impl CellAllocation {
@@ -335,6 +369,10 @@ impl CellAllocation {
     pub fn get_index_base(&self) -> usize {
         self.index_base
     }
+
+    pub fn get_density_base(&self) -> usize {
+        self.density_base
+    }
     pub fn get_ring(&self) -> u8 {
         self.ring
     }
@@ -346,6 +384,9 @@ impl CellAllocation {
     }
     pub fn get_index_count(&self) -> usize {
         self.index_count
+    }
+    pub fn get_density_count(&self) -> usize {
+        self.density_count
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::CellID;
+use crate::consts::CellID;
 use bevy_math::*;
 use lru::LruCache;
 use std::{collections::HashMap, num::NonZeroUsize};

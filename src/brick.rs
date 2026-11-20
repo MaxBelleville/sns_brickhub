@@ -1,4 +1,4 @@
-use super::index;
+use crate::cpu::index::{IndexKind, RawIndex, StartIndex, UNSET_RAW_INDEX};
 use bevy_math::prelude::*;
 use bytemuck;
 #[repr(C)]
@@ -11,7 +11,7 @@ pub struct Brick {
     lod_mask_1x1x1: u8,
     pub _pad: [u8; 2],
 
-    raw_index: index::RawIndex,
+    raw_index: RawIndex,
 }
 impl Default for Brick {
     fn default() -> Self {
@@ -21,7 +21,7 @@ impl Default for Brick {
             lod_mask_2x2x2: 0,
             lod_mask_1x1x1: 0,
             _pad: [0; 2],
-            raw_index: index::UNSET_RAW_INDEX,
+            raw_index: UNSET_RAW_INDEX,
         }
     }
 }
@@ -42,12 +42,13 @@ impl Brick {
             .map(|&m| m.count_ones() as usize)
             .sum()
     }
-    pub fn get_raw_index(&self) -> index::RawIndex {
+
+    pub fn get_raw_index(&self) -> RawIndex {
         self.raw_index
     }
 
-    pub fn set_start_index<K: index::IndexKind>(&mut self, start_index: u32) {
-        self.raw_index = index::StartIndex::<K>::new(start_index).get_raw();
+    pub fn set_start_index<K: IndexKind>(&mut self, start_index: u32) {
+        self.raw_index = StartIndex::<K>::new(start_index).get_raw();
     }
     pub fn set_occupancy(&mut self, word: usize, mask: u64) {
         self.occupancy[word] |= mask;
@@ -60,7 +61,7 @@ impl Brick {
         self.set_lod(voxel);
     }
 
-    pub fn fill_solid<K: index::IndexKind>(&mut self, material_base: u32) {
+    pub fn fill_solid<K: IndexKind>(&mut self, material_base: u32) {
         self.occupancy = [u64::MAX; 8];
         self.lod_mask_4x4x4 = u64::MAX;
         self.lod_mask_2x2x2 = u8::MAX;
@@ -175,5 +176,42 @@ impl BrickStatusGrid {
         let word = brick_index >> 5;
         let bit = brick_index & 31;
         self.masks[word].clear_loaded(bit as u8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_word_offsets_match_shader_layout() {
+        assert_eq!(std::mem::size_of::<Brick>(), 80);
+        assert_eq!(std::mem::offset_of!(Brick, occupancy), 0);
+        assert_eq!(std::mem::offset_of!(Brick, lod_mask_4x4x4), 64);
+        assert_eq!(std::mem::offset_of!(Brick, lod_mask_2x2x2), 72);
+        assert_eq!(std::mem::offset_of!(Brick, lod_mask_1x1x1), 73);
+        assert_eq!(std::mem::offset_of!(Brick, raw_index), 76);
+    }
+
+    #[test]
+    fn lod_masks_pack_shader_skip_levels_and_voxel_occupancy() {
+        let coord = UVec3::new(5, 6, 7);
+        let voxel_index = coord.x + coord.y * 8 + coord.z * 64;
+        let mut brick = Brick::default();
+        brick.set_voxel_occupied(coord, voxel_index as usize);
+
+        let words = bytemuck::cast_slice::<Brick, u32>(std::slice::from_ref(&brick));
+        let group_4x4x4 = (coord.x >> 1) + ((coord.y >> 1) << 2) + ((coord.z >> 1) << 4);
+        let group_2x2x2 = (coord.x >> 2) + ((coord.y >> 2) << 1) + ((coord.z >> 2) << 2);
+        assert_ne!(
+            words[16 + (group_4x4x4 >> 5) as usize] & (1 << (group_4x4x4 & 31)),
+            0
+        );
+        assert_ne!(words[18] & (1 << group_2x2x2), 0);
+        assert_ne!(words[18] & 0x100, 0);
+        assert_ne!(
+            words[(voxel_index >> 6) as usize * 2 + 1] & (1 << (voxel_index & 31)),
+            0
+        );
     }
 }

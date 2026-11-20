@@ -6,6 +6,7 @@ pub struct Buffers {
     bricks: Option<GpuBuffer<Brick>>,
     materials: Option<GpuBuffer<u16>>,
     indices: Option<GpuBuffer<u32>>,
+    density: Option<GpuBuffer<u32>>,
 }
 
 impl Buffers {
@@ -15,10 +16,12 @@ impl Buffers {
         brick_cap: usize,
         material_cap: usize,
         index_cap: usize,
+        density_cap: usize,
     ) -> Result<(), GpuError> {
         ensure_buffer(&mut self.bricks, gpu, brick_cap)?;
         ensure_buffer(&mut self.materials, gpu, material_cap)?;
         ensure_buffer(&mut self.indices, gpu, index_cap)?;
+        ensure_buffer(&mut self.density, gpu, density_cap)?;
         Ok(())
     }
     pub fn handles(&self) -> Option<GpuBufferHandles> {
@@ -26,6 +29,7 @@ impl Buffers {
             bricks: self.bricks.as_ref()?.handle(),
             materials: self.materials.as_ref()?.handle(),
             indices: self.indices.as_ref()?.handle(),
+            density: self.density.as_ref()?.handle(),
         })
     }
     pub fn bricks(&self) -> &GpuBuffer<Brick> {
@@ -43,6 +47,11 @@ impl Buffers {
             .as_ref()
             .expect("index buffer capacity was not ensured")
     }
+    pub fn density(&self) -> &GpuBuffer<u32> {
+        self.density
+            .as_ref()
+            .expect("density buffer capacity was not ensured")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +59,7 @@ pub struct GpuBufferHandles {
     pub bricks: GpuBufferHandle,
     pub materials: GpuBufferHandle,
     pub indices: GpuBufferHandle,
+    pub density: GpuBufferHandle,
 }
 
 fn ensure_buffer<T>(

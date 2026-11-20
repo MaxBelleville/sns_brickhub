@@ -1,11 +1,12 @@
 pub(crate) mod allocators;
 pub(crate) mod device;
+pub mod grid;
 pub(crate) mod scheduler;
+use crate::consts::{BRICKS_PER_BRICKMAP, CellID};
 
-use crate::{
-    BRICKS_PER_BRICKMAP, BrickHubError, CellID, CellKey, CellStore, CompactionFailure,
-    cpu::{CellUploadSnapshot, StorageType},
-};
+use crate::cpu::{CellUploadSnapshot, StorageType};
+
+use crate::{BrickHubError, CellKey, CellStore, CompactionFailure};
 use allocators::DeviceAllocator;
 use device::Buffers;
 use scheduler::DeviceScheduler;
@@ -61,6 +62,7 @@ impl GpuStore {
             self.allocator.brick_capacity(),
             self.allocator.material_capacity(),
             self.allocator.index_capacity(),
+            self.allocator.density_capacity(),
         )?;
         Ok(())
     }
@@ -223,6 +225,7 @@ impl GpuStore {
                     StorageType::Brick => allocation.get_brick_base(),
                     StorageType::Material => allocation.get_material_base(),
                     StorageType::Indices => allocation.get_index_base(),
+                    StorageType::Density => allocation.get_density_base(),
                 };
                 range.destination = base
                     .checked_add(range.from)

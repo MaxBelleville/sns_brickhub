@@ -1,6 +1,14 @@
-use super::*;
-use crate::cell::CellAccessError;
+use super::consts::*;
+use super::{BrickHub, GpuDevice, GpuError};
+use crate::brick::Brick;
+use crate::cell::{BrickHubCell, CellAccessError, GeneratedCell, GeneratedCellStatus};
+use crate::cpu::StorageType;
+use crate::cpu::index::IndexGrid;
+use crate::cpu::map::voxel_in_brick;
+use bevy_math::prelude::*;
 use sns_helper::prelude::{GpuBufferHandle, GpuBufferUsage, GpuCompletion};
+
+use std::sync::{Arc, Mutex};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     mpsc::{Receiver, Sender, channel},
@@ -183,7 +191,7 @@ fn solid_cell_builds_full_bricks_and_coalesced_deltas() {
         0,
         BRICKS_PER_BRICKMAP * VOXELS_PER_BRICK,
     ));
-    assert!(materials.iter().all(|&material_index| material_index == 0));
+    assert!(materials.iter().all(|&material_id| material_id == 17));
     assert_eq!(cell.map().active_brick_count(), BRICKS_PER_BRICKMAP as u32);
     let indices = cell
         .map()
@@ -196,16 +204,110 @@ fn solid_cell_builds_full_bricks_and_coalesced_deltas() {
     );
 
     assert_eq!(
-        cell.delta().take(cpu::StorageType::Brick),
+        cell.delta().take(StorageType::Brick),
         Some((0, BRICKS_PER_BRICKMAP))
     );
     assert_eq!(
-        cell.delta().take(cpu::StorageType::Material),
+        cell.delta().take(StorageType::Material),
         Some((0, BRICKS_PER_BRICKMAP * VOXELS_PER_BRICK))
     );
     assert_eq!(
-        cell.delta().take(cpu::StorageType::Indices),
-        Some((0, BRICKS_PER_BRICKMAP))
+        cell.delta().take(StorageType::Indices),
+        Some((0, INDEX_WORDS_PER_CELL))
+    );
+    // A solid occupancy cell carries no surface; its density uploads as fully outside.
+    assert_eq!(
+        cell.delta().take(StorageType::Density),
+        Some((0, DENSITY_WORDS_PER_CELL))
+    );
+    assert!(
+        cell.map()
+            .density()
+            .word_slice(0, DENSITY_WORDS_PER_CELL)
+            .iter()
+            .all(|&word| word == 0x3c00_3c00)
+    );
+}
+
+/// A spherical density field must classify every brick's wedge from the stored corner
+/// values, allocate brick records for non-empty bricks, mark surface voxels occupied,
+/// and register deltas across all four storage types.
+#[test]
+fn density_cell_classifies_bricks_and_registers_all_deltas() {
+    use crate::cpu::density::WedgeState;
+
+    let mut cell = BrickHubCell::empty();
+    cell.from_density(
+        |corner| {
+            let p = corner.as_vec3() - Vec3::splat(32.0);
+            p.length() - 16.0
+        },
+        17,
+    );
+
+    let active_bricks = {
+        let map = cell.map();
+        assert_eq!(map.used_material_ids(), vec![17]);
+        assert!(map.active_brick_count() > 0);
+
+        let mut wedge_counts = [0usize; 3];
+        for raw_z in 0..BRICKMAP_SIZE as u32 {
+            for raw_y in 0..BRICKMAP_SIZE as u32 {
+                for raw_x in 0..BRICKMAP_SIZE as u32 {
+                    let raw = UVec3::new(raw_x, raw_y, raw_z);
+                    let base = raw * BRICK_SIZE as u32;
+                    let mut minimum = f32::MAX;
+                    let mut maximum = f32::MIN;
+                    for cz in 0..=BRICK_SIZE as u32 {
+                        for cy in 0..=BRICK_SIZE as u32 {
+                            for cx in 0..=BRICK_SIZE as u32 {
+                                let value = map.density().corner(base + UVec3::new(cx, cy, cz));
+                                minimum = minimum.min(value);
+                                maximum = maximum.max(value);
+                            }
+                        }
+                    }
+                    let expected = WedgeState::from_density(minimum, maximum);
+                    assert_eq!(
+                        map.wedge_state(raw),
+                        Some(expected),
+                        "wedge mismatch at {raw:?}"
+                    );
+                    wedge_counts[expected as usize] += 1;
+                }
+            }
+        }
+        // A radius-16 sphere inside a 64^3 cell produces all three classifications.
+        assert!(wedge_counts[WedgeState::Empty as usize] > 0);
+        assert!(wedge_counts[WedgeState::Solid as usize] > 0);
+        assert!(wedge_counts[WedgeState::Shell as usize] > 0);
+
+        // Surface voxels resolve through the occupancy path.
+        let slot_check = map.get_indices(sns_helper::prelude::Range::new(284, 285))[0];
+        assert_ne!(slot_check, crate::consts::EMPTY_BRICK_INDEX);
+        assert!(map.voxel_is_occupied(UVec3::new(32, 32, 32)));
+        assert!(!map.voxel_is_occupied(UVec3::new(0, 0, 0)));
+        assert!(map.voxel_is_occupied(UVec3::new(16, 32, 32)));
+        assert!(!map.voxel_is_occupied(UVec3::new(64, 64, 64)));
+
+        map.active_brick_count() as usize
+    };
+
+    assert_eq!(
+        cell.delta().take(StorageType::Brick),
+        Some((0, active_bricks))
+    );
+    assert_eq!(
+        cell.delta().take(StorageType::Material),
+        Some((0, active_bricks * VOXELS_PER_BRICK))
+    );
+    assert_eq!(
+        cell.delta().take(StorageType::Indices),
+        Some((0, INDEX_WORDS_PER_CELL))
+    );
+    assert_eq!(
+        cell.delta().take(StorageType::Density),
+        Some((0, DENSITY_WORDS_PER_CELL))
     );
 }
 
@@ -261,19 +363,53 @@ fn newer_generation_invalidates_old_worker_result() {
     assert_eq!(results[0].status, GeneratedCellStatus::Stale);
     assert_eq!(results[1].status, GeneratedCellStatus::Committed);
     let handle = hub.cpu.cell_handle(id).unwrap();
-    let (material_index, material_value) = handle
+    let material_id = handle
         .with(|cell| {
-            let material_index = cell
-                .map()
-                .get_material(sns_helper::prelude::Range::new(0, 1))[0];
-            (
-                material_index,
-                cell.map().get_material_definition(material_index),
-            )
+            cell.map()
+                .get_material(sns_helper::prelude::Range::new(0, 1))[0]
         })
         .unwrap();
-    assert_eq!(material_index, 0);
-    assert_eq!(material_value, Some(2));
+    assert_eq!(material_id, 2);
+}
+
+#[test]
+fn gpu_layout_uses_x_fastest_indices_and_zero_empty_sentinel() {
+    let coord = UVec3::new(1, 2, 3);
+    let linear_index = 1 + 2 * BRICKMAP_SIZE + 3 * BRICKMAP_SIZE * BRICKMAP_SIZE;
+    assert_eq!(IndexGrid::index(coord), linear_index);
+    assert_eq!(voxel_in_brick(coord), 1 + 2 * 8 + 3 * 64);
+
+    let mut grid = IndexGrid::default();
+    assert_eq!(grid.get(coord), None);
+    grid.set(coord, 6);
+    assert_eq!(grid.get(coord), Some(6));
+    assert_eq!(grid.slice_range(linear_index, linear_index + 1), &[7]);
+    grid.clear(coord);
+    assert_eq!(
+        grid.slice_range(linear_index, linear_index + 1),
+        &[EMPTY_BRICK_INDEX]
+    );
+}
+
+#[test]
+fn brick_gpu_record_is_twenty_u32_words_with_matching_voxel_bit_order() {
+    assert_eq!(std::mem::size_of::<Brick>(), 80);
+
+    let mut brick = Brick::default();
+    brick.set_voxel_occupied(UVec3::new(1, 2, 3), 1 + 2 * 8 + 3 * 64);
+    assert!(brick.test_occupancy(3, 17));
+    assert_eq!(brick.get_lod_4x4x4_idx(UVec3::new(1, 2, 3)), 20);
+}
+
+#[test]
+fn material_ids_are_global_and_reported_from_occupied_voxels() {
+    let cell = BrickHubCell::from_voxel_sampler(|voxel| match voxel {
+        UVec3 { x: 1, y: 1, z: 1 } => Some(513),
+        UVec3 { x: 2, y: 1, z: 1 } => Some(9),
+        _ => None,
+    });
+
+    assert_eq!(cell.map().used_material_ids(), vec![9, 513]);
 }
 
 #[test]
@@ -321,7 +457,7 @@ fn concurrent_edits_to_one_cell_serialize_and_preserve_deltas() {
     let (material_delta_active, occupied) = handle
         .with_mut(|cell| {
             (
-                cell.delta().is_active(cpu::StorageType::Material),
+                cell.delta().is_active(StorageType::Material),
                 cell.map()
                     .get_brick(sns_helper::prelude::Range::new(0, 8))
                     .iter()
@@ -367,9 +503,9 @@ fn edits_during_gpu_submission_remain_dirty_for_the_next_flush() {
 
     let (mut hub, flush_result) = flushing.join().unwrap();
     flush_result.unwrap();
-    assert_eq!(gpu.upload_count.load(Ordering::SeqCst), 3);
-    hub.flush(&*gpu).unwrap();
     assert_eq!(gpu.upload_count.load(Ordering::SeqCst), 4);
+    hub.flush(&*gpu).unwrap();
+    assert_eq!(gpu.upload_count.load(Ordering::SeqCst), 5);
 }
 
 #[test]
@@ -402,7 +538,7 @@ fn failed_delta_upload_waits_submissions_and_restores_ranges() {
 
     let retry_gpu = TestGpu::new(None);
     hub.flush(&retry_gpu).unwrap();
-    assert_eq!(retry_gpu.upload_count.load(Ordering::SeqCst), 3);
+    assert_eq!(retry_gpu.upload_count.load(Ordering::SeqCst), 4);
 }
 
 #[test]

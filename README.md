@@ -4,7 +4,11 @@
 
 ## Data layout
 
-A cell is 64×64×64 voxels, arranged as 8×8×8 bricks. Each brick covers 8×8×8 voxels. `CellID` is a `bevy_math::IVec3` cell coordinate, and local voxel coordinates are `UVec3` values in `0..64` on each axis. Material IDs are `u16` values. The map deduplicates material definitions within each cell.
+A cell is 64×64×64 voxels, arranged as 8×8×8 bricks. Each brick covers 8×8×8 voxels. `CellID` is a `bevy_math::IVec3` cell coordinate, and local voxel coordinates are `UVec3` values in `0..64` on each axis. Material IDs are packed 16-bit references stored directly in each occupied voxel (see `packed_material`): 2 bits select the BSDF kind (0 = Lambertian, 1 = Metal, 2 = Dielectric), 6 bits index the kind's property buffer, and 8 bits index the shared color buffer. The hub stores a `MaterialPalette` (color buffer + per-kind property buffers; add surfaces with `add_lambertian`/`add_metal`/`add_dielectric` to receive packed references). The hub serializes the palette for upload but never interprets the definitions; `validate_used_materials()` checks every used reference against the stored palette. ID 0 is valid; occupancy determines whether a voxel's material entry is used.
+
+The GPU index grid is x-fastest (`x + y * 8 + z * 64`), with `0` for an empty brick and `brick_slot + 1` for an occupied slot. Voxel indices inside bricks use the same x/y/z ordering. CPU map operations flip Y once when converting API voxel coordinates to the packed representation. `Brick` records are 80 bytes (20 `u32` words): eight 64-bit occupancy words, LOD masks/padding, and the raw material-start index in word 19. Per-cell allocation bases in `CellAllocation` locate each cell's ranges in the shared GPU buffers.
+
+The demo renderer builds a dense, x-fastest lookup grid over the resident cell-coordinate bounds and follows that grid with a cell-level DDA. Within each occupied cell it uses the brick index grid, then the brick's 4³/2³ LOD occupancy masks, before testing individual voxel bits. The cell-grid table is renderer-owned; it must be regenerated whenever resident cells or their GPU allocations change.
 
 ## Create or edit cells
 
@@ -76,7 +80,7 @@ let allocation = hub.gpu_allocation(id).expect("cell has GPU ranges");
 // Use `buffers` plus `allocation` to build backend-specific dispatch or draw metadata.
 ```
 
-The buffers are global typed arrays for bricks, materials, and indices. `CellAllocation` provides each cell's base and count in those arrays. The library does not expose a standalone packed byte blob; the backend consumes the GPU buffer handles and per-cell ranges. The exact interpretation of index entries and brick records must match your shader.
+The buffers are global typed arrays for bricks, materials, and indices. The material buffer is a packed `u16` array of packed material references (`packed_material`: 2-bit kind, 6-bit property index, 8-bit color index); when viewed by WGSL as `array<u32>`, select the lower or upper 16 bits according to the material element's global offset. `CellAllocation` provides each cell's base and count in those arrays. `gpu_cell_allocations()` returns current allocation ranges for all resident cells, and `used_material_ids()` returns the packed references used by occupied voxels. The library does not expose a standalone packed byte blob; the backend consumes the GPU buffer handles and per-cell ranges.
 
 Fetch handles and allocation metadata again after `flush` or `compact`: buffer growth replaces handles, and compaction can move cell ranges. If a render or compute submission continues using a cell's ranges asynchronously, register its completion token with `track_gpu_use(&[key], completion)`. This lets eviction wait before recycling those ranges. Call `begin_evict` to stop new cell access, then poll `process_evictions`; `unload_cell` is a convenience that begins eviction and polls once.
 

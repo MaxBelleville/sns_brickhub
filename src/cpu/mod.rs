@@ -1,13 +1,13 @@
+pub(crate) mod density;
 pub(crate) mod index;
 pub(crate) mod map;
 pub(crate) mod material;
 pub(crate) mod residency;
 
-use crate::{
-    BrickHubCell, CellID, CellKey, GenerationToken, MaterialID,
-    brick::Brick,
-    cell::{CellHandle, CellSlot},
-};
+use crate::brick::Brick;
+use crate::cell::{CellHandle, CellSlot};
+use crate::consts::{CellID, MaterialID};
+use crate::{BrickHubCell, CellKey, GenerationToken};
 use residency::{ResidencyDecision, ResidencyManager, classify_ring};
 use std::{
     collections::HashMap,
@@ -20,6 +20,7 @@ pub(crate) enum StorageType {
     Material,
     #[default]
     Indices,
+    Density,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -72,6 +73,7 @@ pub(crate) struct CellDelta {
     dirty_brick: CellDeltaRange,
     dirty_material: CellDeltaRange,
     dirty_indices: CellDeltaRange,
+    dirty_density: CellDeltaRange,
 }
 
 impl CellDelta {
@@ -93,6 +95,7 @@ impl CellDelta {
             StorageType::Brick => self.dirty_brick.is_active(),
             StorageType::Material => self.dirty_material.is_active(),
             StorageType::Indices => self.dirty_indices.is_active(),
+            StorageType::Density => self.dirty_density.is_active(),
         }
     }
 
@@ -101,6 +104,7 @@ impl CellDelta {
             StorageType::Brick => &mut self.dirty_brick,
             StorageType::Material => &mut self.dirty_material,
             StorageType::Indices => &mut self.dirty_indices,
+            StorageType::Density => &mut self.dirty_density,
         }
     }
 }
@@ -109,6 +113,8 @@ pub(crate) enum UploadData {
     Bricks(Vec<Brick>),
     Materials(Vec<MaterialID>),
     Indices(Vec<u32>),
+    /// Packed fp16 corner words (two corners per word, low half is the even corner).
+    Density(Vec<u32>),
 }
 
 pub(crate) struct UploadRange {
@@ -137,6 +143,32 @@ pub(crate) struct CellStore {
 }
 
 impl CellStore {
+    pub(crate) fn resident_cell_ids(&self) -> Result<Vec<CellID>, crate::BrickHubError> {
+        let mut ids = Vec::new();
+        for (&id, slot) in &self.cells {
+            let state = slot
+                .lock()
+                .map_err(|_| crate::BrickHubError::CellPoisoned(id))?;
+            if state.get_resident() {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable_by_key(|id| (id.x, id.y, id.z));
+        Ok(ids)
+    }
+
+    pub(crate) fn used_material_ids(&self) -> Result<Vec<MaterialID>, crate::BrickHubError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for id in self.resident_cell_ids()? {
+            let slot = self.cells.get(&id).expect("resident cell remains in store");
+            let mut state = slot
+                .lock()
+                .map_err(|_| crate::BrickHubError::CellPoisoned(id))?;
+            ids.extend(state.cell().map().used_material_ids());
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     pub(crate) fn classify_ring(&self, id: CellID, view: CellID) -> Option<u8> {
         classify_ring(id, view)
     }
@@ -305,11 +337,12 @@ impl CellStore {
             if !state.get_resident() {
                 continue;
             }
-            let mut ranges = Vec::with_capacity(3);
+            let mut ranges = Vec::with_capacity(4);
             for storage in [
                 StorageType::Brick,
                 StorageType::Material,
                 StorageType::Indices,
+                StorageType::Density,
             ] {
                 let Some((from, to)) = state.cell().delta().take(storage) else {
                     continue;
@@ -325,6 +358,14 @@ impl CellStore {
                     StorageType::Indices => {
                         UploadData::Indices(state.cell().map().get_indices(range).to_vec())
                     }
+                    StorageType::Density => UploadData::Density(
+                        state
+                            .cell()
+                            .map()
+                            .density()
+                            .word_slice(range.start(), range.end())
+                            .to_vec(),
+                    ),
                 };
                 ranges.push(UploadRange {
                     storage,

@@ -1,17 +1,26 @@
-use crate::{BRICKMAP_SIZE, BRICKS_PER_BRICKMAP};
+use crate::consts::{
+    BRICK_INDEX_ENCODING_BIAS, BRICKMAP_SIZE, BRICKS_PER_BRICKMAP, EMPTY_BRICK_INDEX,
+    INDEX_WORDS_PER_CELL, WEDGE_WORDS_PER_CELL,
+};
 use bevy_math::*;
 use bytemuck::{self, Pod, Zeroable};
 use std::marker::PhantomData;
-#[repr(C)]
 
+const _: () = assert!(BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL == INDEX_WORDS_PER_CELL);
+
+/// Cell-local index buffer: the brick lookup grid (`0..BRICKS_PER_BRICKMAP`, indexed in
+/// *flipped* brick coordinates) followed by the per-brick density wedge states
+/// (`BRICKS_PER_BRICKMAP..INDEX_WORDS_PER_CELL`, packed 2 bits per brick and indexed in
+/// *raw* brick coordinates).
+#[repr(C)]
 pub struct IndexGrid {
-    indices: [u32; BRICKS_PER_BRICKMAP],
+    indices: [u32; INDEX_WORDS_PER_CELL],
 }
 
 impl Default for IndexGrid {
     fn default() -> Self {
         Self {
-            indices: [0; BRICKS_PER_BRICKMAP],
+            indices: [0; INDEX_WORDS_PER_CELL],
         }
     }
 }
@@ -21,17 +30,34 @@ impl IndexGrid {
         (coord.x + coord.y * cell_size + coord.z * cell_size * cell_size) as usize
     }
 
+    fn wedge_index(coord: UVec3) -> usize {
+        BRICKS_PER_BRICKMAP + Self::index(coord) / 16
+    }
     pub fn get(&self, coord: UVec3) -> Option<u32> {
         let v = self.indices[Self::index(coord)];
-        if v == 0 { None } else { Some(v - 1) }
+        if v == EMPTY_BRICK_INDEX {
+            None
+        } else {
+            Some(v - BRICK_INDEX_ENCODING_BIAS)
+        }
     }
 
     pub fn set(&mut self, coord: UVec3, brick_index: u32) {
-        self.indices[Self::index(coord)] = brick_index + 1;
+        self.indices[Self::index(coord)] = brick_index
+            .checked_add(BRICK_INDEX_ENCODING_BIAS)
+            .expect("brick index cannot use the empty sentinel");
     }
     pub fn clear(&mut self, coord: UVec3) {
-        self.indices[Self::index(coord)] = 0;
+        self.indices[Self::index(coord)] = EMPTY_BRICK_INDEX;
     }
+    /// Overwrites the 2-bit density wedge state of the brick at raw `coord`.
+    pub fn set_wedge(&mut self, coord: UVec3, state: u32) {
+        debug_assert!(state < 4);
+        let word = Self::wedge_index(coord);
+        let shift = (Self::index(coord) % 16) * 2;
+        self.indices[word] = (self.indices[word] & !(0b11 << shift)) | (state << shift);
+    }
+
     pub fn slice_range(&self, from: usize, to: usize) -> &[u32] {
         &self.indices[from..to]
     }

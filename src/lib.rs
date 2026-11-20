@@ -1,65 +1,56 @@
 mod brick;
 mod cell;
+mod consts;
 mod cpu;
 mod gpu;
+mod palette;
 
-use cpu::{CellStore, *};
-use gpu::{GpuStore, allocators, scheduler};
+use cpu::CellStore;
+use gpu::GpuStore;
+use palette::{InvalidMaterialReference, MaterialPalette};
 use std::collections::HashSet;
-#[cfg(test)]
-use std::sync::{Arc, Mutex};
 
 use cell::{
     BrickHubCell, CellHandle, CellKey, GeneratedCell, GeneratedCellResult, GeneratedCellStatus,
     GenerationToken,
 };
 
-use bevy_math::*;
 use sns_helper::prelude::{GpuCompletion, GpuDevice, GpuError};
 
-use allocators::CellAllocation;
+use consts::{CellID, MaterialID};
+use gpu::allocators::CellAllocation;
 use gpu::device::GpuBufferHandles;
 
 pub mod prelude {
-    pub use crate::allocators::CellAllocation;
+    pub use crate::BrickHub;
     pub use crate::cell::{
         BrickHubCell, CellAccessError, CellBuildError, CellHandle, CellKey, GeneratedCell,
         GeneratedCellResult, GeneratedCellStatus, GenerationToken,
     };
+    pub use crate::consts::*;
+    pub use crate::cpu::density::{DensityField, WedgeState};
+    pub use crate::cpu::index::LodKind;
+    pub use crate::cpu::map::{brick_index_to_voxel, voxel_in_brick};
+    pub use crate::cpu::material::{
+        MaterialKind, color_index, encode_material, material_kind, property_index, solid_material,
+    };
+    pub use crate::gpu::allocators::CellAllocation;
     pub use crate::gpu::device::GpuBufferHandles;
-    pub use crate::index::LodKind;
-    pub use crate::map::{brick_index_to_voxel, voxel_in_brick};
-    pub use crate::scheduler::{MigrationBuffer, MigrationResolveError};
-
-    pub use crate::{
-        BRICK_SIZE, BRICKMAP_SIZE, BRICKS_PER_BRICKMAP, BrickHub, BrickHubError, BrickID,
-        BrickIndex, CELL_SIZE, CellID, INVALID_BRICK, MATERIAL_BUCKET_SIZE, MapID, MaterialID,
-        MaterialIndex, VOXELS_PER_BRICK,
+    pub use crate::gpu::grid::{
+        CellDescriptor, CellGridBounds, CellGridError, CellGridTable, serialize_cell_allocations,
+    };
+    pub use crate::gpu::scheduler::{MigrationBuffer, MigrationResolveError};
+    pub use crate::palette::{
+        InvalidMaterialReference, MaterialPalette, MaterialPaletteError, MaterialReferenceError,
+        PaletteMaterials,
     };
 }
-
-pub const BRICK_SIZE: usize = 8;
-pub const VOXELS_PER_BRICK: usize = BRICK_SIZE * BRICK_SIZE * BRICK_SIZE; // 512
-pub const MATERIAL_BUCKET_SIZE: usize = VOXELS_PER_BRICK;
-
-pub const BRICKMAP_SIZE: usize = 8; // bricks per axis
-pub const BRICKS_PER_BRICKMAP: usize = BRICKMAP_SIZE * BRICKMAP_SIZE * BRICKMAP_SIZE;
-pub const CELL_SIZE: usize = BRICKMAP_SIZE * BRICK_SIZE;
-pub const INVALID_BRICK: u32 = u32::MAX;
-
-pub type CellID = IVec3;
-pub type MapID = IVec3;
-pub type BrickID = UVec3;
-pub type MaterialID = u16;
-
-pub type MaterialIndex = u16;
-pub type BrickIndex = u32;
 
 #[derive(Debug)]
 pub enum BrickHubError {
     Gpu(GpuError),
-    Allocation(allocators::AllocationError),
-    MigrationResolve(scheduler::MigrationResolveError),
+    Allocation(gpu::allocators::AllocationError),
+    MigrationResolve(gpu::scheduler::MigrationResolveError),
     CellPoisoned(CellID),
     MissingAllocation(CellID),
     MissingCell(CellID),
@@ -90,11 +81,38 @@ impl From<GpuError> for BrickHubError {
 pub struct BrickHub {
     cpu: CellStore,
     gpu: GpuStore,
+    palette: MaterialPalette,
 }
 
 impl BrickHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The color and per-kind property buffers packed material references resolve
+    /// against; the hub stores and serializes them but never interprets them.
+    pub fn material_palette(&self) -> &MaterialPalette {
+        &self.palette
+    }
+
+    pub fn material_palette_mut(&mut self) -> &mut MaterialPalette {
+        &mut self.palette
+    }
+
+    /// Validates every material reference used by resident cells against the stored
+    /// palette, returning one entry per invalid reference (empty result = all valid).
+    pub fn validate_used_materials(&self) -> Result<Vec<InvalidMaterialReference>, BrickHubError> {
+        Ok(self
+            .cpu
+            .used_material_ids()?
+            .into_iter()
+            .filter_map(|material| {
+                self.palette
+                    .validate_material(material)
+                    .err()
+                    .map(|reason| InvalidMaterialReference { material, reason })
+            })
+            .collect())
     }
 
     pub fn get_or_admit_cell(
@@ -107,13 +125,13 @@ impl BrickHub {
 
         if !self.cpu.contains(id) {
             match self.cpu.admit(id, ring, frame) {
-                residency::ResidencyDecision::Admit => {
+                cpu::residency::ResidencyDecision::Admit => {
                     self.cpu.finish_generation(id);
                     self.cpu.insert_cell(id, BrickHubCell::default());
                     self.gpu.admit_cell(id, ring);
                 }
 
-                residency::ResidencyDecision::EvictAndAdmit(evict_id) => {
+                cpu::residency::ResidencyDecision::EvictAndAdmit(evict_id) => {
                     if !self.unload_cell(evict_id).unwrap_or(false) {
                         self.cpu.restore_admission(id, ring, evict_id, frame);
                         return None;
@@ -123,7 +141,7 @@ impl BrickHub {
                     self.gpu.admit_cell(id, ring);
                 }
 
-                residency::ResidencyDecision::Reject => {
+                cpu::residency::ResidencyDecision::Reject => {
                     return None;
                 }
             }
@@ -199,8 +217,8 @@ impl BrickHub {
             }
 
             let status = match self.cpu.admit(id, ring, frame) {
-                residency::ResidencyDecision::Admit => GeneratedCellStatus::Committed,
-                residency::ResidencyDecision::EvictAndAdmit(evict_id) => {
+                cpu::residency::ResidencyDecision::Admit => GeneratedCellStatus::Committed,
+                cpu::residency::ResidencyDecision::EvictAndAdmit(evict_id) => {
                     if !self.unload_cell(evict_id).unwrap_or(false) {
                         self.cpu.restore_admission(id, ring, evict_id, frame);
                         results.push(GeneratedCellResult {
@@ -211,7 +229,7 @@ impl BrickHub {
                     }
                     GeneratedCellStatus::Committed
                 }
-                residency::ResidencyDecision::Reject => {
+                cpu::residency::ResidencyDecision::Reject => {
                     results.push(GeneratedCellResult {
                         id,
                         status: GeneratedCellStatus::RejectedByResidency,
@@ -293,6 +311,25 @@ impl BrickHub {
     pub fn gpu_allocation(&self, id: CellID) -> Option<CellAllocation> {
         self.cpu.cell_key(id)?;
         self.gpu.allocation(id)
+    }
+
+    /// Returns every global material ID referenced by an occupied voxel in a resident cell.
+    pub fn used_material_ids(&self) -> Result<Vec<MaterialID>, BrickHubError> {
+        self.cpu.used_material_ids()
+    }
+
+    /// Returns the current GPU allocation ranges for all resident cells.
+    pub fn gpu_cell_allocations(&self) -> Result<Vec<(CellID, CellAllocation)>, BrickHubError> {
+        self.cpu
+            .resident_cell_ids()?
+            .into_iter()
+            .map(|id| {
+                self.gpu
+                    .allocation(id)
+                    .map(|allocation| (id, allocation))
+                    .ok_or(BrickHubError::MissingAllocation(id))
+            })
+            .collect()
     }
 
     pub fn cell_key(&self, id: CellID) -> Option<CellKey> {

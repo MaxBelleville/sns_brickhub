@@ -41,6 +41,7 @@ pub(crate) struct ResolvedMigration {
     pub bricks: BufferCopy,
     pub materials: BufferCopy,
     pub indices: BufferCopy,
+    pub density: BufferCopy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +49,7 @@ pub enum MigrationBuffer {
     Bricks,
     Materials,
     Indices,
+    Density,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +132,11 @@ impl DeviceScheduler {
                     UploadData::Indices(data) => {
                         buffers
                             .indices()
+                            .upload_range(gpu, range.destination, &data)
+                    }
+                    UploadData::Density(data) => {
+                        buffers
+                            .density()
                             .upload_range(gpu, range.destination, &data)
                     }
                 };
@@ -223,6 +230,20 @@ impl DeviceScheduler {
                     break;
                 }
             }
+            let density_copy = buffers.density().copy_from(
+                gpu,
+                buffers.density(),
+                migration.density.src_offset,
+                migration.density.dst_offset,
+                migration.density.len,
+            );
+            match density_copy {
+                Ok(token) => completions.push(token),
+                Err(error) => {
+                    submission_error = Some(error);
+                    break;
+                }
+            }
         }
         let completion_error = wait_all(completions).err();
         let result = match (submission_error, completion_error) {
@@ -283,6 +304,11 @@ impl GpuMigrationTask {
             self.old_alloc.get_index_count(),
             self.new_alloc.get_index_count(),
         )?;
+        validate(
+            MigrationBuffer::Density,
+            self.old_alloc.get_density_count(),
+            self.new_alloc.get_density_count(),
+        )?;
         Ok(ResolvedMigration {
             id: self.id,
             key: self.key,
@@ -300,6 +326,11 @@ impl GpuMigrationTask {
                 src_offset: self.old_alloc.get_index_base(),
                 dst_offset: self.new_alloc.get_index_base(),
                 len: self.old_alloc.get_index_count(),
+            },
+            density: BufferCopy {
+                src_offset: self.old_alloc.get_density_base(),
+                dst_offset: self.new_alloc.get_density_base(),
+                len: self.old_alloc.get_density_count(),
             },
         })
     }
