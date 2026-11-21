@@ -220,6 +220,23 @@ impl BrickMap {
         brick.test_occupancy(voxel_index >> 6, voxel_index & 63)
     }
 
+    /// Brick storage slot containing the voxel at raw coordinates; `None` when the
+    /// voxel's brick is not allocated (which includes every out-of-cell coordinate).
+    pub fn brick_slot(&self, raw_voxel: UVec3) -> Option<u32> {
+        if raw_voxel.x >= CELL_SIZE as u32
+            || raw_voxel.y >= CELL_SIZE as u32
+            || raw_voxel.z >= CELL_SIZE as u32
+        {
+            return None;
+        }
+        let coord = UVec3::new(
+            raw_voxel.x / BRICK_SIZE as u32,
+            (BRICKMAP_SIZE as u32 - 1) - raw_voxel.y / BRICK_SIZE as u32,
+            raw_voxel.z / BRICK_SIZE as u32,
+        );
+        self.grid.index.get(coord)
+    }
+
     /// Builds the whole cell from a raw-coordinate density sampler (negative inside,
     /// positive outside; corners at `0..65` per axis). Shell and solid bricks get brick
     /// records and per-voxel material entries; wedge states are stored per raw brick

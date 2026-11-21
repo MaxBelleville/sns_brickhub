@@ -10,10 +10,6 @@ use gpu::GpuStore;
 use palette::{InvalidMaterialReference, MaterialPalette};
 use std::collections::HashSet;
 
-// Tables and decoders exist for the upcoming meshing compute shader; until it
-// consumes them from both host and GPU paths, nothing references them outside tests.
-#[allow(dead_code)]
-pub(crate) mod transvoxel;
 
 use cell::{
     BrickHubCell, CellHandle, CellKey, GeneratedCell, GeneratedCellResult, GeneratedCellStatus,
