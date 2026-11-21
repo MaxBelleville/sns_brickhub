@@ -8,9 +8,10 @@ use crate::{
     brick::{Brick, BrickStatusGrid},
     consts::{
         BRICK_SIZE, BRICKMAP_SIZE, BRICKS_PER_BRICKMAP, BrickID, BrickIndex, CELL_SIZE,
-        DENSITY_CORNERS_PER_AXIS, DENSITY_CORNERS_PER_CELL, MaterialID, VOXELS_PER_BRICK,
+        DENSITY_CORNERS_PER_AXIS, DENSITY_CORNERS_PER_CELL, DENSITY_UNSET, MaterialID,
+        VOXELS_PER_BRICK,
     },
-    cpu::density::{DENSITY_UNSET, DensityField, MeshMode, WedgeState, corner_position},
+    cpu::density::{DensityField, MeshMode, WedgeState, corner_position},
     cpu::index::{IndexGrid, IndexKind},
 };
 
@@ -172,8 +173,6 @@ impl BrickMap {
         &mut self.storage.density
     }
 
-    /// Raw brick-coordinate cell-local brick grid coordinate mapping used by the
-    /// wedge section of the index buffer.
     pub fn wedge_state(&self, raw_brick: UVec3) -> Option<WedgeState> {
         let word = BRICKS_PER_BRICKMAP + IndexGrid::index(raw_brick) / 16;
         let shift = (IndexGrid::index(raw_brick) % 16) * 2;
@@ -238,10 +237,7 @@ impl BrickMap {
     }
 
     /// Builds the whole cell from a raw-coordinate density sampler (negative inside,
-    /// positive outside; corners at `0..65` per axis). Shell and solid bricks get brick
-    /// records and per-voxel material entries; wedge states are stored per raw brick
-    /// coordinate, and shell bricks are additionally flagged for iso meshing when
-    /// `mode` is `MeshMode::Iso`. The `sample` function is called once per corner.
+    /// positive outside; corners at `0..65` per axis).
     pub(crate) fn build_from_density(
         &mut self,
         mut sample: impl FnMut(UVec3) -> f32,
@@ -465,9 +461,7 @@ impl BrickMap {
     }
 
     /// Derives a blocky density field from stored occupancy so cells built through the
-    /// occupancy API also render through the density baseline: a corner is inside when
-    /// any adjacent voxel is occupied (in-cell neighbors only). Wedge states classify
-    /// each raw brick coordinate from the same field.
+    /// occupancy API also render through the density baseline
     fn derive_blocky_density(&mut self) {
         let cell_max = (CELL_SIZE - 1) as u32;
         let corner_count = DENSITY_CORNERS_PER_CELL;

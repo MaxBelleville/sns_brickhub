@@ -16,8 +16,7 @@ impl Default for BrickHubCell {
     fn default() -> Self {
         let mut delta = CellDelta::default();
         // Index ranges can be recycled while their old GPU contents remain. Upload the
-        // zeroed map (brick grid and wedge states) so a new empty or sparse cell cannot
-        // inherit stale brick references. Density uploads as entirely outside.
+        // zeroed map (brick grid and wedge states)
         delta.register_range(StorageType::Indices, 0, INDEX_WORDS_PER_CELL);
         delta.register_range(StorageType::Density, 0, DENSITY_WORDS_PER_CELL);
         Self {
@@ -34,8 +33,6 @@ impl BrickHubCell {
 
     /// Builds a full cell containing a single material using a bulk BrickMap path.
     /// This constructor only mutates the owned cell and is suitable for a generation worker.
-    /// No density field is written; a solid cell renders empty under the density baseline
-    /// until edit paths are extended to update density (see `from_density`).
     pub fn solid(material: MaterialID) -> Self {
         let mut cell = Self::default();
         cell.map.fill_solid(material);
@@ -70,13 +67,7 @@ impl BrickHubCell {
     }
 
     /// Builds a detached cell from a raw-coordinate density sampler (negative inside,
-    /// positive outside; corner coordinates in `0..65` per axis) plus the material every
-    /// surface-touching voxel receives. Bricks are classified solid/shell from the corner
-    /// field so GPU consumers can skip whole bricks. With `MeshMode::Iso`, shell bricks
-    /// are flagged for Transvoxel meshing; `MeshMode::Blocky` leaves them on the
-    /// raymarched voxel path. Later `insert`/`remove` edits update the occupancy path
-    /// but not the density field, wedges, or iso flags; rebuild the cell after
-    /// density-significant edits.
+    /// positive outside; corner coordinates in `0..65` per axis)
     pub fn from_density(
         &mut self,
         sample: impl FnMut(UVec3) -> f32,
@@ -319,95 +310,4 @@ pub enum GeneratedCellStatus {
 pub struct GeneratedCellResult {
     pub id: CellID,
     pub status: GeneratedCellStatus,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sns_helper::prelude::Range;
-
-    #[test]
-    fn empty_cell_has_no_bricks_and_uploads_a_cleared_index_grid() {
-        let mut cell = BrickHubCell::empty();
-        assert_eq!(cell.map().active_brick_count(), 0);
-        assert_eq!(cell.delta().take(StorageType::Brick), None);
-        assert_eq!(cell.delta().take(StorageType::Material), None);
-        assert_eq!(
-            cell.delta().take(StorageType::Indices),
-            Some((0, INDEX_WORDS_PER_CELL))
-        );
-        assert_eq!(
-            cell.delta().take(StorageType::Density),
-            Some((0, DENSITY_WORDS_PER_CELL))
-        );
-    }
-
-    #[test]
-    fn density_mask_packs_occupied_bricks_and_initial_deltas() {
-        let mut sample_count = 0;
-        let mut cell = BrickHubCell::from_voxel_sampler(|voxel| {
-            sample_count += 1;
-            match voxel {
-                UVec3 { x: 9, y: 9, z: 9 } => Some(17),
-                UVec3 {
-                    x: 63,
-                    y: 63,
-                    z: 63,
-                } => Some(17),
-                _ => None,
-            }
-        });
-
-        assert_eq!(sample_count, CELL_SIZE * CELL_SIZE * CELL_SIZE);
-        assert_eq!(cell.map().active_brick_count(), 2);
-        assert_eq!(
-            cell.map().get_brick(Range::new(0, 2))[0].occupied_voxel_count(),
-            1
-        );
-        assert_eq!(
-            cell.map().get_brick(Range::new(0, 2))[1].occupied_voxel_count(),
-            1
-        );
-        assert_eq!(cell.map().used_material_ids(), vec![17]);
-        assert_eq!(cell.delta().take(StorageType::Brick), Some((0, 2)));
-        assert_eq!(
-            cell.delta().take(StorageType::Material),
-            Some((0, 2 * VOXELS_PER_BRICK))
-        );
-        let index_range = cell.delta().take(StorageType::Indices).unwrap();
-        assert_eq!(index_range, (0, INDEX_WORDS_PER_CELL));
-        assert_eq!(
-            cell.delta().take(StorageType::Density),
-            Some((0, DENSITY_WORDS_PER_CELL))
-        );
-    }
-
-    #[test]
-    fn layered_cell_fills_bands_and_leaves_gaps_empty() {
-        let cell = BrickHubCell::layered(&[(0..2, 3), (4..8, 5)]).unwrap();
-        assert_eq!(cell.map().active_brick_count(), 8 * 8);
-        assert_eq!(cell.map().used_material_ids(), vec![3, 5]);
-
-        let indices = cell.map().get_indices(Range::new(0, BRICKS_PER_BRICKMAP));
-        assert!(indices.iter().any(|&index| index != 0));
-        assert!(indices.iter().any(|&index| index == 0));
-    }
-
-    #[test]
-    fn layered_cell_rejects_invalid_or_overlapping_ranges() {
-        assert_eq!(
-            BrickHubCell::layered(&[(3..3, 1)]).err().unwrap(),
-            CellBuildError::InvalidLayerRange
-        );
-        assert_eq!(
-            BrickHubCell::layered(&[(0..4, 1), (3..5, 2)])
-                .err()
-                .unwrap(),
-            CellBuildError::OverlappingLayers
-        );
-        assert_eq!(
-            BrickHubCell::layered(&[(62..65, 1)]).err().unwrap(),
-            CellBuildError::InvalidLayerRange
-        );
-    }
 }

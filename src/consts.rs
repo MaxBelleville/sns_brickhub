@@ -34,6 +34,8 @@ pub const CELL_SIZE: usize = BRICKMAP_SIZE * BRICK_SIZE;
 pub const EMPTY_BRICK_INDEX: u32 = 0;
 pub const BRICK_INDEX_ENCODING_BIAS: u32 = 1;
 
+pub const DENSITY_ISOLEVEL: f32 = 0.0;
+pub const DENSITY_UNSET: f32 = 1.0;
 /// Density fields are sampled on the voxel grid corners plus one outer layer (a 65x65x65
 /// field for a 64x64x64 cell), stored as fp16 with two corners per u32 word.
 pub const DENSITY_CORNERS_PER_AXIS: usize = CELL_SIZE + 1;

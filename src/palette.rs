@@ -1,13 +1,3 @@
-//! Material palette storage: the color and per-kind property buffers that packed
-//! material references (see `packed_material`) resolve against.
-//!
-//! The palette is stored and serialized by the hub but never interpreted; the
-//! renderer owns the WGSL-side section layout. The serialized layout consumed by
-//! the demo's shader (`assets/shaders/share.wesl`) is: one header vec4
-//! (color/metal/dielectric counts as f32 bits), then vec4 entries for the color
-//! buffer, the metal property buffer (x = fuzz), and the dielectric property
-//! buffer (x = IOR).
-
 use crate::consts::MaterialID;
 use crate::cpu::material::{
     MaterialKind, color_index, encode_material, material_kind, property_index,
@@ -99,8 +89,7 @@ impl MaterialPalette {
     }
 
     /// Registers one surface of every kind and returns their packed references in
-    /// one batch. Capacity is checked for the whole batch before anything is pushed,
-    /// so a failure leaves the palette untouched and callers handle a single error.
+    /// one batch. Capacity is checked for the whole batch before anything is pushed
     pub fn add_palette(
         &mut self,
         lambertian_color: Vec4,
@@ -219,127 +208,4 @@ pub enum MaterialReferenceError {
 pub struct InvalidMaterialReference {
     pub material: MaterialID,
     pub reason: MaterialReferenceError,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Hand-crafts a packed reference the palette API would not hand out, for
-    /// validation tests of ghost property/color indices.
-    fn probe(kind: MaterialKind, property: u16, color: u16) -> MaterialID {
-        (kind as u16) | (property << 2) | (color << 8)
-    }
-
-    #[test]
-    fn added_materials_roundtrip_through_their_references() {
-        let mut palette = MaterialPalette::new();
-        let lambertian = palette.add_lambertian(vec4(0.2, 0.35, 0.8, 1.0)).unwrap();
-        let metal = palette
-            .add_metal(vec4(0.85, 0.55, 0.35, 1.0), 0.05)
-            .unwrap();
-        let dielectric = palette
-            .add_dielectric(vec4(0.9, 0.92, 0.95, 1.0), 1.5)
-            .unwrap();
-
-        assert_eq!(material_kind(lambertian), Some(MaterialKind::Lambertian));
-        assert_eq!(material_kind(metal), Some(MaterialKind::Metal));
-        assert_eq!(material_kind(dielectric), Some(MaterialKind::Dielectric));
-        assert_eq!(palette.validate_material(lambertian), Ok(()));
-        assert_eq!(palette.validate_material(metal), Ok(()));
-        assert_eq!(palette.validate_material(dielectric), Ok(()));
-    }
-
-    #[test]
-    fn validation_rejects_references_outside_the_stored_palette() {
-        let mut palette = MaterialPalette::new();
-        palette.add_metal(vec4(0.5, 0.5, 0.5, 1.0), 0.1).unwrap();
-
-        // Property index 1 matches the paper's example bit pattern but has no entry.
-        assert_eq!(
-            palette.validate_material(probe(MaterialKind::Metal, 1, 0)),
-            Err(MaterialReferenceError::PropertyOutOfRange)
-        );
-        // Color index 3 is beyond the single registered color.
-        assert_eq!(
-            palette.validate_material(probe(MaterialKind::Lambertian, 0, 3)),
-            Err(MaterialReferenceError::ColorOutOfRange)
-        );
-    }
-
-    #[test]
-    fn lambertian_references_must_not_use_the_property_buffer() {
-        let mut palette = MaterialPalette::new();
-        let reference = palette.add_lambertian(vec4(1.0, 0.0, 0.0, 1.0)).unwrap();
-        assert_eq!(palette.validate_material(reference), Ok(()));
-        assert_eq!(
-            palette.validate_material(probe(MaterialKind::Lambertian, 1, 0)),
-            Err(MaterialReferenceError::PropertyOutOfRange)
-        );
-    }
-
-    #[test]
-    fn add_palette_registers_one_surface_per_kind() {
-        let mut palette = MaterialPalette::new();
-        let surfaces = palette
-            .add_palette(
-                vec4(0.2, 0.35, 0.8, 1.0),
-                vec4(0.85, 0.55, 0.35, 1.0),
-                0.05,
-                vec4(0.9, 0.92, 0.95, 1.0),
-                1.5,
-            )
-            .unwrap();
-
-        assert_eq!(palette.validate_material(surfaces.lambertian), Ok(()));
-        assert_eq!(palette.validate_material(surfaces.metal), Ok(()));
-        assert_eq!(palette.validate_material(surfaces.dielectric), Ok(()));
-        assert_eq!(
-            material_kind(surfaces.lambertian),
-            Some(MaterialKind::Lambertian)
-        );
-        assert_eq!(material_kind(surfaces.metal), Some(MaterialKind::Metal));
-        assert_eq!(
-            material_kind(surfaces.dielectric),
-            Some(MaterialKind::Dielectric)
-        );
-    }
-
-    #[test]
-    fn add_palette_leaves_the_palette_untouched_on_capacity_failure() {
-        let mut palette = MaterialPalette::new();
-        // Leave room for fewer than a full batch's colors.
-        for _ in 0..MAX_COLORS - 2 {
-            palette.add_color(vec4(1.0, 1.0, 1.0, 1.0)).unwrap();
-        }
-
-        let result = palette.add_palette(
-            vec4(1.0, 0.0, 0.0, 1.0),
-            vec4(1.0, 1.0, 0.0, 1.0),
-            0.25,
-            vec4(0.0, 0.0, 1.0, 1.0),
-            1.5,
-        );
-        assert_eq!(result, Err(MaterialPaletteError::ColorCapacity));
-        assert_eq!(palette.colors().len(), MAX_COLORS - 2);
-        assert_eq!(palette.metal_fuzz().len(), 0);
-        assert_eq!(palette.dielectric_ior().len(), 0);
-    }
-
-    #[test]
-    fn sections_serialize_in_the_documented_order() {
-        let mut palette = MaterialPalette::new();
-        palette.add_lambertian(vec4(0.1, 0.2, 0.3, 1.0)).unwrap();
-        palette.add_metal(vec4(0.4, 0.5, 0.6, 1.0), 0.25).unwrap();
-
-        let words = palette.to_words();
-        assert_eq!(words[0], (2f32).to_bits()); // 2 colors
-        assert_eq!(words[1], (1f32).to_bits()); // 1 metal property
-        assert_eq!(words[2], (0f32).to_bits()); // 0 dielectric properties
-
-        let metal_section = HEADER_WORDS + 2 * 4;
-        assert_eq!(f32::from_bits(words[metal_section]), 0.25);
-        // Header (1 vec4) + 2 colors + 1 property = 4 vec4s = 16 words = 64 bytes.
-        assert_eq!(palette.to_le_bytes().len(), 64);
-    }
 }

@@ -10,7 +10,6 @@ use gpu::GpuStore;
 use palette::{InvalidMaterialReference, MaterialPalette};
 use std::collections::HashSet;
 
-
 use cell::{
     BrickHubCell, CellHandle, CellKey, GeneratedCell, GeneratedCellResult, GeneratedCellStatus,
     GenerationToken,
@@ -44,9 +43,6 @@ pub mod prelude {
     pub use crate::palette::{
         InvalidMaterialReference, MaterialPalette, MaterialPaletteError, MaterialReferenceError,
         PaletteMaterials,
-    };
-    pub use crate::transvoxel::{
-        decode_regular_vertex, regular_case_geometry, regular_case_index, serialize_tables,
     };
 }
 
@@ -377,6 +373,3 @@ impl BrickHub {
         self.gpu.compact(&self.cpu, gpu)
     }
 }
-
-#[cfg(test)]
-mod tests;

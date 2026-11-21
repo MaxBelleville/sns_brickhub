@@ -61,11 +61,6 @@ impl CellDeltaRange {
             None
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn is_active(&self) -> bool {
-        self.state == DeltaState::Active
-    }
 }
 
 #[derive(Default)]
@@ -87,16 +82,6 @@ impl CellDelta {
 
     pub(crate) fn take(&mut self, storage: StorageType) -> Option<(usize, usize)> {
         self.range_mut(storage).take()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_active(&self, storage: StorageType) -> bool {
-        match storage {
-            StorageType::Brick => self.dirty_brick.is_active(),
-            StorageType::Material => self.dirty_material.is_active(),
-            StorageType::Indices => self.dirty_indices.is_active(),
-            StorageType::Density => self.dirty_density.is_active(),
-        }
     }
 
     fn range_mut(&mut self, storage: StorageType) -> &mut CellDeltaRange {
