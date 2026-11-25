@@ -1,10 +1,10 @@
 use super::{allocators, device};
-use sns_helper::prelude::{GpuCompletion, GpuDevice, GpuError};
+use sns_helper::prelude::{GpuCompletion, GpuDevice, GpuError,Range};
 use std::collections::HashSet;
 
 use crate::{
-    CellID, CellKey,
-    cpu::{CellUploadSnapshot, UploadData},
+    CellID, CellKey, CellStore,
+    cpu::{CellUploadSnapshot, StorageType},
 };
 
 #[derive(Default)]
@@ -113,35 +113,44 @@ impl DeviceScheduler {
     pub fn execute_delta_uploads(
         &mut self,
         snapshots: &[CellUploadSnapshot],
+        cells: &CellStore,
         buffers: &device::Buffers,
         gpu: &dyn GpuDevice,
     ) -> Result<(), GpuError> {
-        let mut completions: Vec<Box<dyn GpuCompletion>> = Vec::new();
+        let mut completions: Vec<(CellKey, Box<dyn GpuCompletion>)> = Vec::new();
         let mut submission_error = None;
         'snapshots: for snapshot in snapshots {
+            let Some(slot) = cells.get_slot(snapshot.id) else {
+                continue;
+            };
+            let cell_state = match slot.lock() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let cell = cell_state.cell_ref();
             for range in &snapshot.ranges {
-                let result = match &range.data {
-                    UploadData::Bricks(data) => {
-                        buffers.bricks().upload_range(gpu, range.destination, &data)
+                let dest = range.destination;
+                let rng = Range::new(range.from, range.to);
+                let result = match range.storage {
+                    StorageType::Brick => {
+                        let slice = cell.map().get_brick(rng);
+                        buffers.bricks().upload_range(gpu, dest, slice)
                     }
-                    UploadData::Materials(data) => {
-                        buffers
-                            .materials()
-                            .upload_range(gpu, range.destination, &data)
+                    StorageType::Material => {
+                        let slice = cell.map().get_material(rng);
+                        buffers.materials().upload_range(gpu, dest, slice)
                     }
-                    UploadData::Indices(data) => {
-                        buffers
-                            .indices()
-                            .upload_range(gpu, range.destination, &data)
+                    StorageType::Indices => {
+                        let slice = cell.map().get_indices(rng);
+                        buffers.indices().upload_range(gpu, dest, slice)
                     }
-                    UploadData::Density(data) => {
-                        buffers
-                            .density()
-                            .upload_range(gpu, range.destination, &data)
+                    StorageType::Density => {
+                        let slice = cell.map().density().word_slice(range.from, range.to);
+                        buffers.density().upload_range(gpu, dest, slice)
                     }
                 };
                 match result {
-                    Ok(token) => completions.push(token),
+                    Ok(token) => completions.push((snapshot.key, token)),
                     Err(error) => {
                         submission_error = Some(error);
                         break 'snapshots;
@@ -149,7 +158,17 @@ impl DeviceScheduler {
                 }
             }
         }
-        finish_submissions(completions, submission_error)
+        for (key, token) in completions {
+            self.in_flight.push(InFlightUse {
+                cells: std::iter::once(key).collect(),
+                completion: token,
+            });
+        }
+        if let Some(error) = submission_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn enqueue_migration_for_key(
@@ -261,54 +280,53 @@ impl DeviceScheduler {
             }),
             (None, None) => Ok(()),
         };
-        if result.is_ok() {
-            self.resolved_migrations.clear();
-        }
-        result
-    }
-
-    /// Discards transaction work after BrickHub has cancelled or quarantined its reservations.
-    pub fn discard_migrations(&mut self) {
-        self.migration_queue.clear();
         self.resolved_migrations.clear();
+        result
     }
 }
 
 impl GpuMigrationTask {
-    fn resolve(self) -> Result<ResolvedMigration, MigrationResolveError> {
-        let validate = |buffer, old_count, new_count| {
-            if old_count == new_count {
-                Ok(())
-            } else {
-                Err(MigrationResolveError {
-                    id: self.id,
-                    key: self.key,
-                    buffer,
-                    old_count,
-                    new_count,
-                })
-            }
-        };
-        validate(
-            MigrationBuffer::Bricks,
-            self.old_alloc.get_brick_count(),
-            self.new_alloc.get_brick_count(),
-        )?;
-        validate(
-            MigrationBuffer::Materials,
-            self.old_alloc.get_material_count(),
-            self.new_alloc.get_material_count(),
-        )?;
-        validate(
-            MigrationBuffer::Indices,
-            self.old_alloc.get_index_count(),
-            self.new_alloc.get_index_count(),
-        )?;
-        validate(
-            MigrationBuffer::Density,
-            self.old_alloc.get_density_count(),
-            self.new_alloc.get_density_count(),
-        )?;
+    pub fn resolve(self) -> Result<ResolvedMigration, MigrationResolveError> {
+        let brick_count = self.old_alloc.get_brick_count();
+        if self.new_alloc.get_brick_count() != brick_count {
+            return Err(MigrationResolveError {
+                id: self.id,
+                key: self.key,
+                buffer: MigrationBuffer::Bricks,
+                old_count: brick_count,
+                new_count: self.new_alloc.get_brick_count(),
+            });
+        }
+        let material_count = self.old_alloc.get_material_count();
+        if self.new_alloc.get_material_count() != material_count {
+            return Err(MigrationResolveError {
+                id: self.id,
+                key: self.key,
+                buffer: MigrationBuffer::Materials,
+                old_count: material_count,
+                new_count: self.new_alloc.get_material_count(),
+            });
+        }
+        let index_count = self.old_alloc.get_index_count();
+        if self.new_alloc.get_index_count() != index_count {
+            return Err(MigrationResolveError {
+                id: self.id,
+                key: self.key,
+                buffer: MigrationBuffer::Indices,
+                old_count: index_count,
+                new_count: self.new_alloc.get_index_count(),
+            });
+        }
+        let density_count = self.old_alloc.get_density_count();
+        if self.new_alloc.get_density_count() != density_count {
+            return Err(MigrationResolveError {
+                id: self.id,
+                key: self.key,
+                buffer: MigrationBuffer::Density,
+                old_count: density_count,
+                new_count: self.new_alloc.get_density_count(),
+            });
+        }
         Ok(ResolvedMigration {
             id: self.id,
             key: self.key,
@@ -348,17 +366,5 @@ fn wait_all(completions: Vec<Box<dyn GpuCompletion>>) -> Result<(), GpuError> {
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
-    }
-}
-
-fn finish_submissions(
-    completions: Vec<Box<dyn GpuCompletion>>,
-    submission_error: Option<GpuError>,
-) -> Result<(), GpuError> {
-    let completion_error = wait_all(completions).err();
-    match (submission_error, completion_error) {
-        (Some(error), _) => Err(error),
-        (None, Some(error)) => Err(error),
-        (None, None) => Ok(()),
     }
 }

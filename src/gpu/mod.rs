@@ -114,7 +114,7 @@ impl GpuStore {
 
         if let Err(error) =
             self.scheduler
-                .execute_delta_uploads(&upload_snapshots, &self.buffers, gpu)
+                .execute_delta_uploads(&upload_snapshots, cells, &self.buffers, gpu)
         {
             first_error.get_or_insert(error.into());
             restore_snapshots.extend(upload_snapshots);
@@ -174,7 +174,6 @@ impl GpuStore {
         }
         if let Err(error) = self.scheduler.resolve_migrations() {
             let cleanup = self.allocator.cancel_compaction(reservations);
-            self.scheduler.discard_migrations();
             cleanup.map_err(|error| CompactionFailure::safe(BrickHubError::Allocation(error)))?;
             return Err(CompactionFailure::safe(BrickHubError::MigrationResolve(
                 error,
@@ -183,7 +182,6 @@ impl GpuStore {
         if let Err(failure) = self.scheduler.execute_migrations(&self.buffers, gpu) {
             let uncertain_cells = if failure.destination_uncertain {
                 let result = self.allocator.quarantine_compaction(reservations);
-                self.scheduler.discard_migrations();
                 result
                     .map_err(|error| CompactionFailure::safe(BrickHubError::Allocation(error)))?;
                 reservations
@@ -192,7 +190,6 @@ impl GpuStore {
                     .collect()
             } else {
                 let result = self.allocator.cancel_compaction(reservations);
-                self.scheduler.discard_migrations();
                 result
                     .map_err(|error| CompactionFailure::safe(BrickHubError::Allocation(error)))?;
                 HashSet::new()

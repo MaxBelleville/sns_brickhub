@@ -1,11 +1,12 @@
 use crate::consts::{
-    BRICKS_PER_BRICKMAP, BrickID, CELL_SIZE, CellID, DENSITY_WORDS_PER_CELL, INDEX_WORDS_PER_CELL,
-    MaterialID, VOXELS_PER_BRICK,
+    BRICKS_PER_BRICKMAP, BrickID, CELL_SIZE, CellID, DENSITY_CORNERS_PER_AXIS,
+    DENSITY_WORDS_PER_CELL, INDEX_WORDS_PER_CELL, MaterialID, VOXELS_PER_BRICK,
 };
-use crate::cpu::density::MeshMode;
 use crate::cpu::{CellDelta, StorageType, map};
 use bevy_math::prelude::*;
+use sns_helper::prelude::{Noise3d, NoiseKind3d, NoiseSampler, SampledNoise3d};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct BrickHubCell {
@@ -16,7 +17,7 @@ impl Default for BrickHubCell {
     fn default() -> Self {
         let mut delta = CellDelta::default();
         // Index ranges can be recycled while their old GPU contents remain. Upload the
-        // zeroed map (brick grid and wedge states)
+        // zeroed map (brick grid and fill classifications)
         delta.register_range(StorageType::Indices, 0, INDEX_WORDS_PER_CELL);
         delta.register_range(StorageType::Density, 0, DENSITY_WORDS_PER_CELL);
         Self {
@@ -66,15 +67,20 @@ impl BrickHubCell {
         cell
     }
 
-    /// Builds a detached cell from a raw-coordinate density sampler (negative inside,
-    /// positive outside; corner coordinates in `0..65` per axis)
+    /// Builds a detached cell from a raw-coordinate density sampler (below
+    /// `isolevel` is inside; corner coordinates in `0..65` per axis). `isolevel`
+    /// and `flag_partial_bricks` are renderer-supplied surface conventions; this
+    /// crate only stores their results.
     pub fn from_density(
         &mut self,
         sample: impl FnMut(UVec3) -> f32,
         material: MaterialID,
-        mode: MeshMode,
+        isolevel: f32,
+        flag_partial_bricks: bool,
     ) {
-        let ranges = self.map.build_from_density(sample, material, mode);
+        let ranges =
+            self.map
+                .build_from_density(sample, material, isolevel, flag_partial_bricks);
         self.delta
             .register_range(StorageType::Indices, 0, INDEX_WORDS_PER_CELL);
         self.delta
@@ -178,6 +184,9 @@ impl CellSlot {
     pub fn cell(&mut self) -> &mut BrickHubCell {
         &mut self.cell
     }
+    pub fn cell_ref(&self) -> &BrickHubCell {
+        &self.cell
+    }
 
     pub(crate) fn new(key: super::CellKey, resident: bool, cell: BrickHubCell) -> Self {
         Self {
@@ -204,6 +213,7 @@ enum CellState {
 pub struct CellHandle {
     key: super::CellKey,
     slot: Arc<Mutex<CellSlot>>,
+    dirty: Arc<AtomicBool>,
 }
 
 impl CellHandle {
@@ -213,6 +223,27 @@ impl CellHandle {
 
     pub fn key(&self) -> CellKey {
         self.key
+    }
+
+    /// Bulk-samples a 3D noise family across this cell's 65^3 density corner
+    /// lattice in one backend call, positioned at the cell's integer origin. Feed
+    /// the result to `from_density` through `sampled.get_vec3(corner)`. Lattice
+    /// points sit `1.0` apart in noise space at `(id + corner) * frequency`, so
+    /// the world scale belongs in `NoiseSettings::frequency` and neighboring
+    /// cells join seamlessly (the lattice is global and integer-aligned).
+    /// `kind` only selects the noise family at the type level (e.g. `Fbm3D`).
+    pub fn sample_noise<K, T>(&self, noise: &NoiseSampler<T>, kind: K, seed: i32) -> SampledNoise3d
+    where
+        K: NoiseKind3d,
+        T: Noise3d<K>,
+    {
+        let _ = kind;
+        let pos = self.key.id.as_vec3();
+        noise.sample_vec3::<K>(
+            pos,
+            UVec3::splat(DENSITY_CORNERS_PER_AXIS as u32),
+            seed,
+        )
     }
 
     pub fn with_mut<R>(
@@ -226,7 +257,9 @@ impl CellHandle {
         if slot.state != CellState::Resident {
             return Err(CellAccessError::Inactive(self.key.id));
         }
-        Ok(edit(&mut slot.cell))
+        let result = edit(&mut slot.cell);
+        self.dirty.store(true, Ordering::Release);
+        Ok(result)
     }
 
     pub fn with<R>(&self, read: impl FnOnce(&BrickHubCell) -> R) -> Result<R, CellAccessError> {
@@ -240,8 +273,12 @@ impl CellHandle {
         Ok(read(&slot.cell))
     }
 
-    pub(crate) fn new(key: CellKey, slot: Arc<Mutex<CellSlot>>) -> Self {
-        Self { key, slot }
+    pub(crate) fn new(
+        key: CellKey,
+        slot: Arc<Mutex<CellSlot>>,
+        dirty: Arc<AtomicBool>,
+    ) -> Self {
+        Self { key, slot, dirty }
     }
 }
 
@@ -289,6 +326,10 @@ impl GeneratedCell {
     }
     pub(crate) fn token(&self) -> &GenerationToken {
         &self.token
+    }
+
+    pub fn cell_ref(&self) -> &BrickHubCell {
+        &self.cell
     }
 
     pub(crate) fn cell(self) -> BrickHubCell {

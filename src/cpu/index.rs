@@ -1,20 +1,17 @@
 use crate::consts::{
     BRICK_INDEX_ENCODING_BIAS, BRICKMAP_SIZE, BRICKS_PER_BRICKMAP, EMPTY_BRICK_INDEX,
-    INDEX_WORDS_PER_CELL, ISO_WORDS_PER_CELL, WEDGE_WORDS_PER_CELL,
+    FILL_CLASS_WORDS_PER_CELL, INDEX_WORDS_PER_CELL,
 };
 use bevy_math::*;
 use bytemuck::{self, Pod, Zeroable};
 use std::marker::PhantomData;
 
-const _: () = assert!(
-    BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL + ISO_WORDS_PER_CELL == INDEX_WORDS_PER_CELL
-);
-
 /// Cell-local index buffer: the brick lookup grid (`0..BRICKS_PER_BRICKMAP`, indexed in
-/// *flipped* brick coordinates), the per-brick density wedge states
-/// (`BRICKS_PER_BRICKMAP..` that + `WEDGE_WORDS_PER_CELL`, packed 2 bits per brick),
-/// then the per-brick iso-meshing flags (1 bit per brick), all indexed in *raw* brick
-/// coordinates.
+/// *flipped* brick coordinates), the per-brick 2-bit fill classification
+/// (`BRICKS_PER_BRICKMAP..` that + `FILL_CLASS_WORDS_PER_CELL`), then one
+/// general-purpose per-brick flag bit, all indexed in *raw* brick coordinates.
+/// The renderer assigns meaning to the classification and flag; the storage
+/// library only preserves the bits.
 #[repr(C)]
 pub struct IndexGrid {
     indices: [u32; INDEX_WORDS_PER_CELL],
@@ -33,7 +30,7 @@ impl IndexGrid {
         (coord.x + coord.y * cell_size + coord.z * cell_size * cell_size) as usize
     }
 
-    fn wedge_index(coord: UVec3) -> usize {
+    fn fill_class_index(coord: UVec3) -> usize {
         BRICKS_PER_BRICKMAP + Self::index(coord) / 16
     }
     pub fn get(&self, coord: UVec3) -> Option<u32> {
@@ -53,30 +50,30 @@ impl IndexGrid {
     pub fn clear(&mut self, coord: UVec3) {
         self.indices[Self::index(coord)] = EMPTY_BRICK_INDEX;
     }
-    /// Overwrites the 2-bit density wedge state of the brick at raw `coord`.
-    pub fn set_wedge(&mut self, coord: UVec3, state: u32) {
-        debug_assert!(state < 4);
-        let word = Self::wedge_index(coord);
+    /// Overwrites the 2-bit fill classification of the brick at raw `coord`.
+    pub fn set_fill_class(&mut self, coord: UVec3, class: u32) {
+        debug_assert!(class < 4);
+        let word = Self::fill_class_index(coord);
         let shift = (Self::index(coord) % 16) * 2;
-        self.indices[word] = (self.indices[word] & !(0b11 << shift)) | (state << shift);
+        self.indices[word] = (self.indices[word] & !(0b11 << shift)) | (class << shift);
     }
 
-    fn iso_index(coord: UVec3) -> usize {
-        BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL + Self::index(coord) / 32
+    fn flag_index(coord: UVec3) -> usize {
+        BRICKS_PER_BRICKMAP + FILL_CLASS_WORDS_PER_CELL + Self::index(coord) / 32
     }
-    /// Sets the iso-meshing flag of the brick at raw `coord`.
-    pub fn set_iso(&mut self, coord: UVec3, iso: bool) {
-        let word = Self::iso_index(coord);
+    /// Sets the general-purpose flag bit of the brick at raw `coord`.
+    pub fn set_brick_flag(&mut self, coord: UVec3, set: bool) {
+        let word = Self::flag_index(coord);
         let bit = 1u32 << (Self::index(coord) % 32);
-        self.indices[word] = if iso {
+        self.indices[word] = if set {
             self.indices[word] | bit
         } else {
             self.indices[word] & !bit
         };
     }
-    /// Iso-meshing flag of the brick at raw `coord`.
-    pub fn iso(&self, coord: UVec3) -> bool {
-        let word = self.indices[Self::iso_index(coord)];
+    /// General-purpose flag bit of the brick at raw `coord`.
+    pub fn brick_flag(&self, coord: UVec3) -> bool {
+        let word = self.indices[Self::flag_index(coord)];
         word & (1u32 << (Self::index(coord) % 32)) != 0
     }
 

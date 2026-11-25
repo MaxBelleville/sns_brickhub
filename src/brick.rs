@@ -76,6 +76,14 @@ impl Brick {
         (coord.x as usize >> 2) + ((coord.y as usize >> 2) << 1) + ((coord.z as usize >> 2) << 2)
     }
 
+    pub fn lod_mask_4x4x4(&self) -> u64 {
+        self.lod_mask_4x4x4
+    }
+
+    pub fn lod_mask_2x2x2(&self) -> u8 {
+        self.lod_mask_2x2x2
+    }
+
     pub fn any_voxel_lod_4x4x4(&self, coord: UVec3) -> bool {
         let bx = (coord.x >> 1) << 1;
         let by = (coord.y >> 1) << 1;

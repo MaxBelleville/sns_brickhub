@@ -1,37 +1,41 @@
 use crate::consts::{
-    DENSITY_CORNERS_PER_AXIS, DENSITY_CORNERS_PER_CELL, DENSITY_ISOLEVEL, DENSITY_UNSET,
-    DENSITY_WORDS_PER_CELL,
+    DENSITY_CORNERS_PER_AXIS, DENSITY_CORNERS_PER_CELL, DENSITY_UNSET, DENSITY_WORDS_PER_CELL,
 };
 use bevy_math::UVec3;
 use half::f16;
 
+/// Neutral classification of a brick's 9^3 corner samples. The numeric values
+/// are the 2-bit codes stored in the cell's index buffer; the renderer decides
+/// what a `Partial` brick means (e.g. transvoxel polygonization).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum WedgeState {
-    /// Every corner of the brick is outside the material.
+pub enum BrickFill {
+    /// Every corner is outside the solid.
     Empty = 0,
-    /// Every corner of the brick is inside the material.
-    Solid = 1,
-    /// The iso surface passes through the brick.
-    Shell = 2,
+    /// Every corner is inside the solid.
+    Full = 1,
+    /// The surface passes through the brick.
+    Partial = 2,
 }
 
-impl WedgeState {
-    pub fn from_density(minimum: f32, maximum: f32) -> Self {
-        if minimum > DENSITY_ISOLEVEL {
+impl BrickFill {
+    /// The isolevel is passed in by the caller; the storage library does not
+    /// own a surface convention.
+    pub fn from_density(minimum: f32, maximum: f32, isolevel: f32) -> Self {
+        if minimum > isolevel {
             Self::Empty
-        } else if maximum <= DENSITY_ISOLEVEL {
-            Self::Solid
+        } else if maximum <= isolevel {
+            Self::Full
         } else {
-            Self::Shell
+            Self::Partial
         }
     }
 
     pub fn from_bits(bits: u32) -> Option<Self> {
         match bits {
             0 => Some(Self::Empty),
-            1 => Some(Self::Solid),
-            2 => Some(Self::Shell),
+            1 => Some(Self::Full),
+            2 => Some(Self::Partial),
             _ => None,
         }
     }
@@ -39,14 +43,6 @@ impl WedgeState {
     pub fn bits(self) -> u32 {
         self as u32
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MeshMode {
-    /// Render as voxel cubes through the occupancy/density raymarcher.
-    Blocky,
-    /// Flag shell bricks so the Transvoxel meshing dispatch polygonizes them.
-    Iso,
 }
 
 fn corner_index(corner: UVec3) -> usize {

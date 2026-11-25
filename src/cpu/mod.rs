@@ -2,16 +2,18 @@ pub(crate) mod density;
 pub(crate) mod index;
 pub(crate) mod map;
 pub(crate) mod material;
-pub(crate) mod residency;
+pub mod residency;
 
-use crate::brick::Brick;
 use crate::cell::{CellHandle, CellSlot};
 use crate::consts::{CellID, MaterialID};
 use crate::{BrickHubCell, CellKey, GenerationToken};
 use residency::{ResidencyDecision, ResidencyManager, classify_ring};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Clone, Copy, Default, Eq, PartialEq, Hash)]
@@ -94,20 +96,11 @@ impl CellDelta {
     }
 }
 
-pub(crate) enum UploadData {
-    Bricks(Vec<Brick>),
-    Materials(Vec<MaterialID>),
-    Indices(Vec<u32>),
-    /// Packed fp16 corner words (two corners per word, low half is the even corner).
-    Density(Vec<u32>),
-}
-
 pub(crate) struct UploadRange {
     pub(crate) storage: StorageType,
     pub(crate) from: usize,
     pub(crate) to: usize,
     pub(crate) destination: usize,
-    pub(crate) data: UploadData,
 }
 
 pub(crate) struct CellUploadSnapshot {
@@ -125,9 +118,23 @@ pub(crate) struct CellStore {
     next_generation_epoch: u64,
     next_cell_generation: u64,
     pending_evictions: HashMap<CellKey, u8>,
+    dirty: Arc<AtomicBool>,
 }
 
 impl CellStore {
+    pub(crate) fn has_pending_uploads(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn get_slot(&self, id: CellID) -> Option<Arc<Mutex<CellSlot>>> {
+        self.cells.get(&id).cloned()
+    }
+
     pub(crate) fn resident_cell_ids(&self) -> Result<Vec<CellID>, crate::BrickHubError> {
         let mut ids = Vec::new();
         for (&id, slot) in &self.cells {
@@ -199,7 +206,7 @@ impl CellStore {
         }
         let key = state.key();
         drop(state);
-        Some(CellHandle::new(key, slot))
+        Some(CellHandle::new(key, slot, self.dirty.clone()))
     }
 
     pub(crate) fn touch(&mut self, id: CellID, ring: u8, frame: u64) {
@@ -305,10 +312,14 @@ impl CellStore {
         };
         self.cells
             .insert(id, Arc::new(Mutex::new(CellSlot::new(key, true, cell))));
+        self.dirty.store(true, Ordering::Release);
         key
     }
 
     pub(crate) fn snapshot_uploads(&self) -> Result<Vec<CellUploadSnapshot>, crate::BrickHubError> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
         let mut snapshots = Vec::new();
         for (&id, slot) in &self.cells {
             let mut state = match slot.lock() {
@@ -332,40 +343,22 @@ impl CellStore {
                 let Some((from, to)) = state.cell().delta().take(storage) else {
                     continue;
                 };
-                let range = sns_helper::prelude::Range::new(from, to);
-                let data = match storage {
-                    StorageType::Brick => {
-                        UploadData::Bricks(state.cell().map().get_brick(range).to_vec())
-                    }
-                    StorageType::Material => {
-                        UploadData::Materials(state.cell().map().get_material(range).to_vec())
-                    }
-                    StorageType::Indices => {
-                        UploadData::Indices(state.cell().map().get_indices(range).to_vec())
-                    }
-                    StorageType::Density => UploadData::Density(
-                        state
-                            .cell()
-                            .map()
-                            .density()
-                            .word_slice(range.start(), range.end())
-                            .to_vec(),
-                    ),
-                };
                 ranges.push(UploadRange {
                     storage,
                     from,
                     to,
                     destination: 0,
-                    data,
                 });
             }
-            snapshots.push(CellUploadSnapshot {
-                id,
-                key: state.key(),
-                ranges,
-            });
+            if !ranges.is_empty() {
+                snapshots.push(CellUploadSnapshot {
+                    id,
+                    key: state.key(),
+                    ranges,
+                });
+            }
         }
+        self.dirty.store(false, Ordering::Release);
         Ok(snapshots)
     }
 
@@ -373,6 +366,7 @@ impl CellStore {
         &self,
         snapshots: &[CellUploadSnapshot],
     ) -> Result<(), crate::BrickHubError> {
+        let mut restored = false;
         for snapshot in snapshots {
             let Some(slot) = self.cells.get(&snapshot.id) else {
                 continue;
@@ -393,7 +387,11 @@ impl CellStore {
                     .cell()
                     .delta()
                     .register_range(range.storage, range.from, range.to);
+                restored = true;
             }
+        }
+        if restored {
+            self.dirty.store(true, Ordering::Release);
         }
         Ok(())
     }

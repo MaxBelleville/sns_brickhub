@@ -34,7 +34,6 @@ pub const CELL_SIZE: usize = BRICKMAP_SIZE * BRICK_SIZE;
 pub const EMPTY_BRICK_INDEX: u32 = 0;
 pub const BRICK_INDEX_ENCODING_BIAS: u32 = 1;
 
-pub const DENSITY_ISOLEVEL: f32 = 0.0;
 pub const DENSITY_UNSET: f32 = 1.0;
 /// Density fields are sampled on the voxel grid corners plus one outer layer (a 65x65x65
 /// field for a 64x64x64 cell), stored as fp16 with two corners per u32 word.
@@ -43,22 +42,19 @@ pub const DENSITY_CORNERS_PER_CELL: usize =
     DENSITY_CORNERS_PER_AXIS * DENSITY_CORNERS_PER_AXIS * DENSITY_CORNERS_PER_AXIS;
 pub const DENSITY_WORDS_PER_CELL: usize = DENSITY_CORNERS_PER_CELL.div_ceil(2);
 
-/// Per-brick surface classification packed as 2 bits into the tail of the cell's
-/// index buffer: 16 bricks per u32 word, `WEDGE_WORDS_PER_CELL` words after the
-/// brick index grid. Wedge coordinates use raw (unflipped) brick coordinates; the
-/// brick index grid in the same buffer uses flipped coordinates.
-pub const WEDGE_BITS_PER_BRICK: usize = 2;
-pub const BRICKS_PER_WEDGE_WORD: usize = 32 / WEDGE_BITS_PER_BRICK;
-pub const WEDGE_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP / BRICKS_PER_WEDGE_WORD;
-/// Per-brick iso-meshing flag packed as 1 bit, `ISO_WORDS_PER_CELL` words after the
-/// wedge states (32 bricks per u32 word). Bricks flagged for iso are candidates for
-/// Transvoxel meshing; unflagged bricks render as voxel cubes. Raw brick
-/// coordinates, same convention as the wedge states.
-pub const ISO_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP / 32;
-/// Total words of the cell-local index buffer: brick lookup grid, wedge states,
-/// iso flags.
+/// Per-brick 2-bit fill classification packed into the tail of the cell's index
+/// buffer: 16 bricks per u32 word. Classification coordinates use raw
+/// (unflipped) brick coordinates; the brick lookup grid uses flipped ones.
+pub const FILL_CLASS_BITS_PER_BRICK: usize = 2;
+pub const BRICKS_PER_FILL_CLASS_WORD: usize = 32 / FILL_CLASS_BITS_PER_BRICK;
+pub const FILL_CLASS_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP / BRICKS_PER_FILL_CLASS_WORD;
+
+/// One general-purpose flag bit per brick, after the fill classifications.
+pub const BRICK_FLAG_WORDS_PER_CELL: usize = BRICKS_PER_BRICKMAP / 32;
+/// Total words of the cell-local index buffer: brick lookup grid, fill classes,
+/// brick flags.
 pub const INDEX_WORDS_PER_CELL: usize =
-    BRICKS_PER_BRICKMAP + WEDGE_WORDS_PER_CELL + ISO_WORDS_PER_CELL;
+    BRICKS_PER_BRICKMAP + FILL_CLASS_WORDS_PER_CELL + BRICK_FLAG_WORDS_PER_CELL;
 
 pub const KIND_BITS: u16 = 2;
 pub const PROPERTY_BITS: u16 = 6;

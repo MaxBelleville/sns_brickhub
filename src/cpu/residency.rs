@@ -89,21 +89,34 @@ impl ResidencyManager {
     }
 }
 
+// Trial schedule: tighter near rings plus two outer levels so the outer edge of
+// a growing population can render at lod 3/4. Earlier schedules were
+// 3 / 6 / 9 / 12 and 4 / 8 / 16; restore this array and consts.wesl to revert.
 pub const CLIPMAP_RINGS: &[ClipmapRing] = &[
     ClipmapRing {
         level: 0,
-        radius_cells: 4,
-        max_cells: 9 * 9 * 9,
+        radius_cells: 3,
+        max_cells: 7 * 7 * 7,
     },
     ClipmapRing {
         level: 1,
-        radius_cells: 8,
-        max_cells: 17 * 17 * 17,
+        radius_cells: 6,
+        max_cells: 13 * 13 * 13,
     },
     ClipmapRing {
         level: 2,
-        radius_cells: 16,
-        max_cells: 33 * 33 * 33,
+        radius_cells: 9,
+        max_cells: 19 * 19 * 19,
+    },
+    ClipmapRing {
+        level: 3,
+        radius_cells: 12,
+        max_cells: 25 * 25 * 25,
+    },
+    ClipmapRing {
+        level: 4,
+        radius_cells: 15,
+        max_cells: 31 * 31 * 31,
     },
 ];
 

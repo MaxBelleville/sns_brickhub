@@ -28,9 +28,13 @@ pub mod prelude {
         GeneratedCellResult, GeneratedCellStatus, GenerationToken,
     };
     pub use crate::consts::*;
-    pub use crate::cpu::density::{DensityField, MeshMode, WedgeState};
+    pub use crate::cpu::density::DensityField;
     pub use crate::cpu::index::LodKind;
-    pub use crate::cpu::map::{brick_index_to_voxel, voxel_in_brick};
+    // Clipmap ring schedule: the shared source of truth for residency budgets,
+    // camera-driven LOD ladders, and transition-side derivation.
+    pub use crate::cpu::residency::{classify_ring, ClipmapRing, CLIPMAP_RINGS};
+
+    pub use crate::cpu::map::{BrickMap, brick_index_to_voxel, voxel_in_brick};
     pub use crate::cpu::material::{
         MaterialKind, color_index, encode_material, material_kind, property_index, solid_material,
     };
@@ -82,11 +86,32 @@ pub struct BrickHub {
     cpu: CellStore,
     gpu: GpuStore,
     palette: MaterialPalette,
+    allocations_dirty: bool,
 }
 
 impl BrickHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether any CPU cells have pending delta uploads.
+    pub fn has_pending_uploads(&self) -> bool {
+        self.cpu.has_pending_uploads()
+    }
+
+    /// Whether residency or GPU cell allocation ranges changed since last cleared.
+    pub fn allocations_dirty(&self) -> bool {
+        self.allocations_dirty
+    }
+
+    /// True if either uploads or cell allocations need GPU synchronization.
+    pub fn is_dirty(&self) -> bool {
+        self.has_pending_uploads() || self.allocations_dirty
+    }
+
+    /// Clears the allocations dirty flag after reading and serializing them.
+    pub fn clear_allocations_dirty(&mut self) {
+        self.allocations_dirty = false;
     }
 
     /// The color and per-kind property buffers packed material references resolve
@@ -129,6 +154,7 @@ impl BrickHub {
                     self.cpu.finish_generation(id);
                     self.cpu.insert_cell(id, BrickHubCell::default());
                     self.gpu.admit_cell(id, ring);
+                    self.allocations_dirty = true;
                 }
 
                 cpu::residency::ResidencyDecision::EvictAndAdmit(evict_id) => {
@@ -139,6 +165,7 @@ impl BrickHub {
                     self.cpu.finish_generation(id);
                     self.cpu.insert_cell(id, BrickHubCell::default());
                     self.gpu.admit_cell(id, ring);
+                    self.allocations_dirty = true;
                 }
 
                 cpu::residency::ResidencyDecision::Reject => {
@@ -237,8 +264,19 @@ impl BrickHub {
                     continue;
                 }
             };
-            self.cpu.insert_cell(id, generated.cell());
+            let cell = generated.cell();
+            // Validate materials against stored palette on admission
+            for material in cell.map().used_material_ids() {
+                if let Err(reason) = self.palette.validate_material(material) {
+                    eprintln!(
+                        "Invalid material reference in cell {:?}: material {}, reason: {:?}",
+                        id, material, reason
+                    );
+                }
+            }
+            self.cpu.insert_cell(id, cell);
             self.gpu.admit_cell(id, ring);
+            self.allocations_dirty = true;
             results.push(GeneratedCellResult { id, status });
         }
         results
@@ -254,6 +292,7 @@ impl BrickHub {
             .get_ring();
         let key = self.cpu.begin_evict(id, ring)?;
         self.gpu.cancel_cell_migrations(key);
+        self.allocations_dirty = true;
         Ok(key)
     }
 
@@ -274,6 +313,9 @@ impl BrickHub {
             }
             self.cpu.complete_eviction(key);
             completed.push(key);
+        }
+        if !completed.is_empty() {
+            self.allocations_dirty = true;
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -370,6 +412,8 @@ impl BrickHub {
     /// Compacts GPU allocations independently of ordinary delta flushing. Dirty CPU edits
     /// remain tracked and will upload to the new allocation on the next `flush`.
     pub fn compact(&mut self, gpu: &dyn GpuDevice) -> Result<(), BrickHubError> {
-        self.gpu.compact(&self.cpu, gpu)
+        let result = self.gpu.compact(&self.cpu, gpu);
+        self.allocations_dirty = true;
+        result
     }
 }

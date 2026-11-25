@@ -8,5 +8,5 @@ sns_helper = { git = "https://github.com/MaxBelleville/sns_helper.git", features
 bevy_math = {version = "0.20.1"}
 bytemuck = "1.25.2"
 half = "2.7.1"
-lru = "0.19.0"
+lru = "0.19.2"
 smallvec = "1.16.6"
