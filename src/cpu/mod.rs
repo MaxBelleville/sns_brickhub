@@ -4,10 +4,14 @@ pub(crate) mod map;
 pub(crate) mod material;
 pub mod residency;
 
+use bevy_math::Vec3;
 use crate::cell::{CellHandle, CellSlot};
 use crate::consts::{CellID, MaterialID};
 use crate::{BrickHubCell, CellKey, GenerationToken};
-use residency::{ResidencyDecision, ResidencyManager, classify_ring};
+use residency::{
+    ResidencyDecision, ResidencyManager, Section, SectionId, SectionResidencyDecision,
+    classify_ring, classify_section,
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -119,6 +123,8 @@ pub(crate) struct CellStore {
     next_cell_generation: u64,
     pending_evictions: HashMap<CellKey, u8>,
     dirty: Arc<AtomicBool>,
+    /// World-space point the camera is looking at; gates outer-ring cells.
+    look_at: Option<Vec3>,
 }
 
 impl CellStore {
@@ -162,7 +168,47 @@ impl CellStore {
     }
 
     pub(crate) fn classify_ring(&self, id: CellID, view: CellID) -> Option<u8> {
-        classify_ring(id, view)
+        classify_ring(id, view, self.look_at)
+    }
+
+    pub(crate) fn classify_section(&self, section: SectionId, view: SectionId) -> Option<u8> {
+        classify_section(section, view, self.look_at)
+    }
+
+    /// Every cell in the section has a resident slot.
+    pub(crate) fn section_resident(&self, section: Section) -> bool {
+        section
+            .cell_ids()
+            .iter()
+            .all(|&id| self.cell_key(id).is_some())
+    }
+
+    pub(crate) fn touch_section(&mut self, section: SectionId, ring: u8, frame: u64) {
+        self.residency.touch_section(section, ring, frame);
+    }
+
+    pub(crate) fn admit_section(
+        &mut self,
+        section: SectionId,
+        ring: u8,
+        frame: u64,
+    ) -> SectionResidencyDecision {
+        self.residency.admit_section(section, ring, frame)
+    }
+
+    pub(crate) fn restore_section_admission(
+        &mut self,
+        section: SectionId,
+        ring: u8,
+        evicted: SectionId,
+        frame: u64,
+    ) {
+        self.residency.remove_section(section, ring);
+        self.residency.touch_section(evicted, ring, frame);
+    }
+
+    pub(crate) fn set_look_at(&mut self, look_at: Option<Vec3>) {
+        self.look_at = look_at;
     }
 
     pub(crate) fn contains(&self, id: CellID) -> bool {
@@ -224,6 +270,12 @@ impl CellStore {
 
     pub(crate) fn begin_generation(&mut self, id: CellID, view: CellID) -> Option<GenerationToken> {
         self.classify_ring(id, view)?;
+        self.begin_generation_unchecked(id)
+    }
+
+    /// Section generation has already been classified in 2D; do not re-run the
+    /// 3D cell cone rule (its Y component would disagree with section LOD).
+    pub(crate) fn begin_generation_unchecked(&mut self, id: CellID) -> Option<GenerationToken> {
         if self.cells.contains_key(&id) {
             return None;
         }

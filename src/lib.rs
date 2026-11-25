@@ -5,7 +5,9 @@ mod cpu;
 mod gpu;
 mod palette;
 
+use bevy_math::Vec3;
 use cpu::CellStore;
+use cpu::residency::{SECTION_CELL_LAYERS, Section, SectionId, section_of_cell};
 use gpu::GpuStore;
 use palette::{InvalidMaterialReference, MaterialPalette};
 use std::collections::HashSet;
@@ -22,7 +24,7 @@ use gpu::allocators::CellAllocation;
 use gpu::device::GpuBufferHandles;
 
 pub mod prelude {
-    pub use crate::BrickHub;
+    pub use crate::{BrickHub, SectionGeneration};
     pub use crate::cell::{
         BrickHubCell, CellAccessError, CellBuildError, CellHandle, CellKey, GeneratedCell,
         GeneratedCellResult, GeneratedCellStatus, GenerationToken,
@@ -32,7 +34,10 @@ pub mod prelude {
     pub use crate::cpu::index::LodKind;
     // Clipmap ring schedule: the shared source of truth for residency budgets,
     // camera-driven LOD ladders, and transition-side derivation.
-    pub use crate::cpu::residency::{classify_ring, ClipmapRing, CLIPMAP_RINGS};
+    pub use crate::cpu::residency::{
+        classify_ring, classify_section, section_cell, section_of_cell, ClipmapRing, Section,
+        SectionId, SectionID, SectionResidencyDecision, CLIPMAP_RINGS, SECTION_CELL_LAYERS,
+    };
 
     pub use crate::cpu::map::{BrickMap, brick_index_to_voxel, voxel_in_brick};
     pub use crate::cpu::material::{
@@ -78,6 +83,21 @@ impl CompactionFailure {
 impl From<GpuError> for BrickHubError {
     fn from(error: GpuError) -> Self {
         Self::Gpu(error)
+    }
+}
+
+/// Bundle of generation tokens for every cell in a vertical section. With
+/// `SECTION_CELL_LAYERS = 1` it holds a single token; the type is already shaped
+/// for sections that own several stacked cells.
+#[derive(Clone, Debug)]
+pub struct SectionGeneration {
+    pub section: Section,
+    pub tokens: Vec<GenerationToken>,
+}
+
+impl SectionGeneration {
+    pub fn primary_token(&self) -> GenerationToken {
+        self.tokens[0]
     }
 }
 
@@ -282,6 +302,174 @@ impl BrickHub {
         results
     }
 
+    /// Starts a CPU generation job for a whole vertical section. The section is
+    /// classified in 2D, so altitude never changes which sections are generated.
+    pub fn begin_section_generation(
+        &mut self,
+        section: Section,
+        view_section: SectionId,
+        _frame: u64,
+    ) -> Option<SectionGeneration> {
+        self.cpu.classify_section(section.id, view_section)?;
+        let mut tokens = Vec::with_capacity(section.cell_count as usize);
+        for id in section.cell_ids() {
+            if self.cpu.contains(id) {
+                return None; // generate/evict the column as a unit
+            }
+            tokens.push(self.cpu.begin_generation_unchecked(id)?);
+        }
+        if tokens.is_empty() {
+            return None;
+        }
+        Some(SectionGeneration { section, tokens })
+    }
+
+    /// Commits worker results using section residency. Results are still
+    /// individual `GeneratedCell`s (the worker API is per cell), but LRU and
+    /// eviction decisions are made per x/z section.
+    pub fn commit_generated_sections(
+        &mut self,
+        generated: impl IntoIterator<Item = GeneratedCell>,
+        view_section: SectionId,
+        frame: u64,
+    ) -> Vec<GeneratedCellResult> {
+        let mut results = Vec::new();
+        for generated in generated {
+            let token = generated.token();
+            let id = token.id();
+            let section = Section {
+                id: section_of_cell(id),
+                y_base: id.y,
+                cell_count: SECTION_CELL_LAYERS,
+            };
+
+            if !self.cpu.generation_is_current(token) {
+                results.push(GeneratedCellResult {
+                    id,
+                    status: GeneratedCellStatus::Stale,
+                });
+                continue;
+            }
+            self.cpu.finish_generation(id);
+
+            let Some(ring) = self.cpu.classify_section(section.id, view_section) else {
+                results.push(GeneratedCellResult {
+                    id,
+                    status: GeneratedCellStatus::OutsideResidency,
+                });
+                continue;
+            };
+            if self.cell_key(id).is_some() {
+                results.push(GeneratedCellResult {
+                    id,
+                    status: GeneratedCellStatus::AlreadyResident,
+                });
+                continue;
+            }
+            if self.cpu.has_pending_eviction(id) {
+                results.push(GeneratedCellResult {
+                    id,
+                    status: GeneratedCellStatus::EvictionPending,
+                });
+                continue;
+            }
+
+            let status = match self.cpu.admit_section(section.id, ring, frame) {
+                cpu::residency::SectionResidencyDecision::Admit => GeneratedCellStatus::Committed,
+                cpu::residency::SectionResidencyDecision::EvictAndAdmit(evicted_id) => {
+                    let evicted = Section {
+                        id: evicted_id,
+                        y_base: 0,
+                        cell_count: SECTION_CELL_LAYERS,
+                    };
+                    if !self.unload_section(evicted) {
+                        self.cpu
+                            .restore_section_admission(section.id, ring, evicted_id, frame);
+                        results.push(GeneratedCellResult {
+                            id,
+                            status: GeneratedCellStatus::EvictionPending,
+                        });
+                        continue;
+                    }
+                    GeneratedCellStatus::Committed
+                }
+                cpu::residency::SectionResidencyDecision::Reject => {
+                    results.push(GeneratedCellResult {
+                        id,
+                        status: GeneratedCellStatus::RejectedByResidency,
+                    });
+                    continue;
+                }
+            };
+
+            let cell = generated.cell();
+            for material in cell.map().used_material_ids() {
+                if let Err(reason) = self.palette.validate_material(material) {
+                    eprintln!(
+                        "Invalid material reference in cell {:?}: material {}, reason: {:?}",
+                        id, material, reason
+                    );
+                }
+            }
+            self.cpu.insert_cell(id, cell);
+            self.gpu.admit_cell(id, ring);
+            self.allocations_dirty = true;
+            results.push(GeneratedCellResult { id, status });
+        }
+        results
+    }
+
+    /// Reserves (or touches) a whole section and returns one handle per cell.
+    pub fn get_or_admit_section(
+        &mut self,
+        section: Section,
+        view_section: SectionId,
+        frame: u64,
+    ) -> Option<Vec<CellHandle>> {
+        let ring = self.cpu.classify_section(section.id, view_section)?;
+        if self.cpu.section_resident(section) {
+            self.cpu.touch_section(section.id, ring, frame);
+        } else {
+            match self.cpu.admit_section(section.id, ring, frame) {
+                cpu::residency::SectionResidencyDecision::Admit => {}
+                cpu::residency::SectionResidencyDecision::EvictAndAdmit(evicted_id) => {
+                    let evicted = Section {
+                        id: evicted_id,
+                        y_base: 0,
+                        cell_count: SECTION_CELL_LAYERS,
+                    };
+                    if !self.unload_section(evicted) {
+                        self.cpu
+                            .restore_section_admission(section.id, ring, evicted_id, frame);
+                        return None;
+                    }
+                }
+                cpu::residency::SectionResidencyDecision::Reject => return None,
+            }
+            for id in section.cell_ids() {
+                self.cpu.finish_generation(id);
+                self.cpu.insert_cell(id, BrickHubCell::default());
+                self.gpu.admit_cell(id, ring);
+            }
+            self.allocations_dirty = true;
+        }
+        section
+            .cell_ids()
+            .iter()
+            .map(|&id| self.cpu.cell_handle(id))
+            .collect()
+    }
+
+    fn unload_section(&mut self, section: Section) -> bool {
+        let mut ok = true;
+        for id in section.cell_ids() {
+            if self.cell_key(id).is_some() && !self.unload_cell(id).unwrap_or(false) {
+                ok = false;
+            }
+        }
+        ok
+    }
+
     /// Starts eviction. Logical residency and new work stop immediately; GPU ranges remain
     /// allocated until `process_evictions` observes completion of all tracked submissions.
     pub fn begin_evict(&mut self, id: CellID) -> Result<CellKey, BrickHubError> {
@@ -372,6 +560,10 @@ impl BrickHub {
                     .ok_or(BrickHubError::MissingAllocation(id))
             })
             .collect()
+    }
+
+    pub fn set_look_at(&mut self, look_at: Option<Vec3>) {
+        self.cpu.set_look_at(look_at);
     }
 
     pub fn cell_key(&self, id: CellID) -> Option<CellKey> {
